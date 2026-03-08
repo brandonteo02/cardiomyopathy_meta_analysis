@@ -1,0 +1,206 @@
+---
+title: "Cardiomyopathy WGCNA"
+author: "Brandon Teo"
+date: "2026-03-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Background
+
+Dilated cardiomyopathy (DCM) is the most common non-ischaemic cardiomyopathy and a leading cause of heart failure and transplantation. Disease progression is driven in part by maladaptive extracellular matrix (ECM) remodelling and cardiac fibrosis, yet the co-ordinated transcriptional programmes underlying these processes remain poorly characterised.
+Standard differential expression analysis identifies individual genes that differ between conditions but treats each gene independently, offering limited insight into the higher-order regulatory networks that govern complex phenotypes like fibrosis. Weighted Gene Co-expression Network Analysis (WGCNA) addresses this limitation by grouping genes into modules of co-expressed transcripts and summarising each module with a single eigengene. Module eigengenes can then be correlated with clinical traits, such as disease status, to identify gene programmes collectively associated with DCM. Hub genes within trait-associated modules, defined by high intramodular connectivity, represent candidate regulators of disease-relevant processes.
+Thus, we apply WGCNA to bulk RNA-seq data from two independent studies of human left ventricular myocardium (GSE116250 and GSE141910), focusing exclusively on DCM patients and non-failing controls. We construct a co-expression network, identify trait-associated modules, and characterise them through pathway enrichment analysis with particular attention to ECM organisation and TGF-β signalling. This network-based approach complements conventional differential expression by providing a systems-level view of the transcriptomic landscape of DCM-associated cardiac fibrosis.
+
+Research question: What co-expressed gene modules are robustly associated with dilated cardiomyopathy across independent bulk RNA-seq cohorts, and do module-level transcriptional programs implicate fibrotic, inflammatory, or metabolic dysregulation as primary drivers of disease?
+
+```{r load libraries}
+library(WGCNA)
+library(DESeq2)
+library(GEOquery)
+library(tidyverse)
+library(CorLevelPlot)
+library(gridExtra)
+```
+
+```{r load datasets}
+setwd("~/Desktop/University/NUS research task/Cardiomyopathy WGCNA/")
+gse116250 <- getGEO(filename = "GSE116250_series_matrix.txt")
+gse141910 <- getGEO(filename = "GSE141910_series_matrix.txt.gz")
+getwd()
+```
+
+```{r get metadata}
+gse116250_phenoData <- pData(phenoData(gse116250))
+gse141910_phenoData <- pData(phenoData(gse141910))
+
+# Show all column names so we can identify the disease column
+cat("=== GSE116250 columns ===\n"); print(colnames(gse116250_phenoData))
+cat("=== GSE141910 columns ===\n"); print(colnames(gse141910_phenoData))
+
+# Show unique values in any characteristics columns
+gse116250_char_cols <- grep("characteristics", colnames(gse116250_phenoData), value = TRUE)
+for (col in gse116250_char_cols) { cat("\nGSE116250 -", col, ":\n"); print(table(gse116250_phenoData[[col]])) }
+
+gse141910_char_cols <- grep("characteristics", colnames(gse141910_phenoData), value = TRUE)
+for (col in gse141910_char_cols) { cat("\nGSE141910 -", col, ":\n"); print(table(gse141910_phenoData[[col]])) }
+```
+
+```{r filter samples}
+# Find the characteristics column that contains disease labels (not tissue/age/sex)
+find_disease_col <- function(phenoData) {
+  char_cols <- grep("characteristics", colnames(phenoData), value = TRUE)
+  char_cols[sapply(char_cols, function(col) any(grepl("^disease:", phenoData[[col]])))][[1]]
+}
+
+# Filter GSE116250: keep only non-failing and dilated cardiomyopathy samples
+gse116250_disease_col <- find_disease_col(gse116250_phenoData)
+gse116250_keep <- grepl("non.fail|dilated", gse116250_phenoData[[gse116250_disease_col]], ignore.case = TRUE)
+gse116250_phenoData <- gse116250_phenoData[gse116250_keep, ]
+cat("GSE116250 samples retained:", nrow(gse116250_phenoData), "\n")
+table(gse116250_phenoData[[gse116250_disease_col]])
+
+# Filter GSE141910: keep only non-failing and dilated cardiomyopathy samples
+gse141910_disease_col <- find_disease_col(gse141910_phenoData)
+gse141910_keep <- grepl("non.fail|dilated", gse141910_phenoData[[gse141910_disease_col]], ignore.case = TRUE)
+gse141910_phenoData <- gse141910_phenoData[gse141910_keep, ]
+cat("GSE141910 samples retained:", nrow(gse141910_phenoData), "\n")
+table(gse141910_phenoData[[gse141910_disease_col]])
+```
+
+```{r load expression data}
+# --- GSE116250: download RPKM supplementary file ---
+if (!file.exists("GSE116250_rpkm.txt.gz")) {
+  getGEOSuppFiles("GSE116250", makeDirectory = FALSE, baseDir = ".")
+}
+rpkm_116250 <- read.table("GSE116250_rpkm.txt.gz", header = TRUE, row.names = 1, sep = "\t")
+
+# --- GSE141910: download per-sample count CSVs ---
+if (!file.exists("GSE141910_RAW.tar")) {
+  getGEOSuppFiles("GSE141910", makeDirectory = FALSE, baseDir = ".")
+}
+if (!dir.exists("GSE141910_counts")) {
+  dir.create("GSE141910_counts")
+  untar("GSE141910_RAW.tar", exdir = "GSE141910_counts")
+}
+csv_files <- list.files("GSE141910_counts", pattern = "\\.csv\\.gz$", full.names = TRUE)
+counts_list <- lapply(csv_files, function(f) {
+  df <- read.csv(f, header = FALSE, row.names = 1, col.names = c("gene", "count"))
+  setNames(df$count, rownames(df))
+})
+gsm_ids <- sub(".*?(GSM\\d+).*", "\\1", basename(csv_files))
+count_matrix_141910 <- do.call(cbind, counts_list)
+colnames(count_matrix_141910) <- gsm_ids
+```
+
+```{r normalize expression data}
+# --- GSE116250: log2(RPKM + 1), filter to retained samples ---
+kept_samples_116250 <- rownames(gse116250_phenoData)
+rpkm_116250 <- rpkm_116250[, colnames(rpkm_116250) %in% kept_samples_116250, drop = FALSE]
+
+# Filter lowly expressed genes: keep genes with RPKM >= 1 in at least 50% of samples
+keep_116250 <- rowSums(rpkm_116250 >= 1) >= (ncol(rpkm_116250) * 0.5)
+rpkm_116250 <- rpkm_116250[keep_116250, ]
+expr_116250 <- log2(rpkm_116250 + 1)
+cat("GSE116250: retained", nrow(expr_116250), "genes across", ncol(expr_116250), "samples\n")
+
+# --- GSE141910: DESeq2 VST on raw counts, filter to retained samples ---
+kept_samples_141910 <- rownames(gse141910_phenoData)
+count_matrix_141910 <- count_matrix_141910[, colnames(count_matrix_141910) %in% kept_samples_141910, drop = FALSE]
+count_matrix_141910 <- count_matrix_141910[rowSums(count_matrix_141910) > 0, ]
+
+col_data_141910 <- data.frame(
+  row.names = colnames(count_matrix_141910),
+  disease = gse141910_phenoData[colnames(count_matrix_141910), gse141910_disease_col]
+)
+dds_141910 <- DESeqDataSetFromMatrix(
+  countData = count_matrix_141910,
+  colData   = col_data_141910,
+  design    = ~1
+)
+keep_141910 <- rowSums(counts(dds_141910) >= 10) >= (ncol(dds_141910) * 0.5)
+dds_141910 <- dds_141910[keep_141910, ]
+vst_141910 <- vst(dds_141910, blind = TRUE)
+expr_141910 <- assay(vst_141910)
+cat("GSE141910: retained", nrow(expr_141910), "genes across", ncol(expr_141910), "samples\n")
+```
+
+```{r outlier detection}
+# Transpose to samples x genes for WGCNA; detect outliers via hierarchical clustering
+wgcna_116250 <- t(expr_116250)
+wgcna_141910 <- t(expr_141910)
+
+par(mfrow = c(1, 2))
+plot(hclust(dist(wgcna_116250), method = "average"), main = "GSE116250 sample clustering",
+     xlab = "", sub = "", cex = 0.6)
+plot(hclust(dist(wgcna_141910), method = "average"), main = "GSE141910 sample clustering",
+     xlab = "", sub = "", cex = 0.6)
+par(mfrow = c(1, 1))
+# Inspect dendrograms and remove obvious outlier samples before network construction
+```
+
+```{r goodSamplesGenes check}
+# Check for genes/samples with excessive missing values or zero variance
+gsg_116250 <- goodSamplesGenes(wgcna_116250, verbose = 3)
+if (!gsg_116250$allOK) {
+  wgcna_116250 <- wgcna_116250[gsg_116250$goodSamples, gsg_116250$goodGenes]
+  cat("GSE116250: removed", sum(!gsg_116250$goodSamples), "samples and",
+      sum(!gsg_116250$goodGenes), "genes\n")
+}
+cat("GSE116250 final dimensions:", nrow(wgcna_116250), "samples x", ncol(wgcna_116250), "genes\n")
+
+gsg_141910 <- goodSamplesGenes(wgcna_141910, verbose = 3)
+if (!gsg_141910$allOK) {
+  wgcna_141910 <- wgcna_141910[gsg_141910$goodSamples, gsg_141910$goodGenes]
+  cat("GSE141910: removed", sum(!gsg_141910$goodSamples), "samples and",
+      sum(!gsg_141910$goodGenes), "genes\n")
+}
+cat("GSE141910 final dimensions:", nrow(wgcna_141910), "samples x", ncol(wgcna_141910), "genes\n")
+```
+
+```{r soft threshold selection, fig.width=12, fig.height=5}
+# Test powers 1-20 and pick the lowest power giving scale-free R^2 >= 0.85
+powers <- 1:20
+
+sft_116250 <- pickSoftThreshold(wgcna_116250, powerVector = powers,
+                                networkType = "signed", verbose = 2)
+sft_141910 <- pickSoftThreshold(wgcna_141910, powerVector = powers,
+                                networkType = "signed", verbose = 2)
+
+par(mfrow = c(2, 2))
+
+# GSE116250
+plot(sft_116250$fitIndices[, 1], -sign(sft_116250$fitIndices[, 3]) * sft_116250$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology R^2",
+     main = "GSE116250: Scale-free fit", type = "n")
+text(sft_116250$fitIndices[, 1], -sign(sft_116250$fitIndices[, 3]) * sft_116250$fitIndices[, 2],
+     labels = powers, col = "red")
+abline(h = 0.85, col = "red", lty = 2)
+
+plot(sft_116250$fitIndices[, 1], sft_116250$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     main = "GSE116250: Mean connectivity", type = "n")
+text(sft_116250$fitIndices[, 1], sft_116250$fitIndices[, 5], labels = powers, col = "red")
+
+# GSE141910
+plot(sft_141910$fitIndices[, 1], -sign(sft_141910$fitIndices[, 3]) * sft_141910$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology R^2",
+     main = "GSE141910: Scale-free fit", type = "n")
+text(sft_141910$fitIndices[, 1], -sign(sft_141910$fitIndices[, 3]) * sft_141910$fitIndices[, 2],
+     labels = powers, col = "red")
+abline(h = 0.85, col = "red", lty = 2)
+
+plot(sft_141910$fitIndices[, 1], sft_141910$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     main = "GSE141910: Mean connectivity", type = "n")
+text(sft_141910$fitIndices[, 1], sft_141910$fitIndices[, 5], labels = powers, col = "red")
+
+par(mfrow = c(1, 1))
+
+# Print recommended powers
+cat("GSE116250 recommended power:", sft_116250$powerEstimate, "\n")
+cat("GSE141910 recommended power:", sft_141910$powerEstimate, "\n")
+```
