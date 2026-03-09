@@ -17,190 +17,423 @@ Thus, we apply WGCNA to bulk RNA-seq data from two independent studies of human 
 
 Research question: What co-expressed gene modules are robustly associated with dilated cardiomyopathy across independent bulk RNA-seq cohorts, and do module-level transcriptional programs implicate fibrotic, inflammatory, or metabolic dysregulation as primary drivers of disease?
 
-```{r load libraries}
+---
+
+## Step 1: Load Libraries
+
+```{r install_bioc_packages, message=FALSE, warning=FALSE}
+# Install Bioconductor packages if not already present
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+bioc_pkgs <- c("WGCNA", "DESeq2", "GEOquery", "AnnotationDbi", "org.Hs.eg.db", "sva")
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    BiocManager::install(pkg)
+}
+```
+
+```{r load_libraries, message=FALSE, warning=FALSE}
 library(WGCNA)
 library(DESeq2)
 library(GEOquery)
 library(tidyverse)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(sva)
 library(CorLevelPlot)
 library(gridExtra)
+
+# Allow multi-threading for WGCNA
+allowWGCNAThreads()
 ```
 
-```{r load datasets}
+---
+
+## Step 2: Load Metadata (Series Matrices)
+
+```{r load_metadata, message=FALSE, warning=FALSE}
 setwd("~/Desktop/University/NUS research task/Cardiomyopathy WGCNA/")
-gse116250 <- getGEO(filename = "GSE116250_series_matrix.txt")
-gse141910 <- getGEO(filename = "GSE141910_series_matrix.txt.gz")
-getwd()
+
+# Load GEO series matrix files — these contain sample-level metadata only
+gse116250_geo <- getGEO(filename = "GSE116250_series_matrix.txt",    GSEMatrix = TRUE)
+gse141910_geo <- getGEO(filename = "GSE141910_series_matrix.txt.gz", GSEMatrix = TRUE)
+
+# Extract phenotypic data tables (rows = samples, columns = metadata fields)
+pheno_gse116250 <- pData(phenoData(gse116250_geo))
+pheno_gse141910 <- pData(phenoData(gse141910_geo))
+
+cat("GSE116250 total samples:", nrow(pheno_gse116250), "\n")
+cat("GSE141910 total samples:", nrow(pheno_gse141910), "\n")
 ```
 
-```{r get metadata}
-gse116250_phenoData <- pData(phenoData(gse116250))
-gse141910_phenoData <- pData(phenoData(gse141910))
+---
 
-# Show all column names so we can identify the disease column
-cat("=== GSE116250 columns ===\n"); print(colnames(gse116250_phenoData))
-cat("=== GSE141910 columns ===\n"); print(colnames(gse141910_phenoData))
+## Step 3: Filter Metadata to DCM and Non-Failing Samples Only
 
-# Show unique values in any characteristics columns
-gse116250_char_cols <- grep("characteristics", colnames(gse116250_phenoData), value = TRUE)
-for (col in gse116250_char_cols) { cat("\nGSE116250 -", col, ":\n"); print(table(gse116250_phenoData[[col]])) }
+```{r filter_metadata}
+# --- GSE116250 ---
+# Condition is stored in the 'disease:ch1' column
+# Values: "dilated cardiomyopathy", "ischemic cardiomyopathy", "non-failing"
+cat("GSE116250 disease groups:\n")
+print(table(pheno_gse116250[["disease:ch1"]]))
 
-gse141910_char_cols <- grep("characteristics", colnames(gse141910_phenoData), value = TRUE)
-for (col in gse141910_char_cols) { cat("\nGSE141910 -", col, ":\n"); print(table(gse141910_phenoData[[col]])) }
+pheno_gse116250 <- pheno_gse116250 %>%
+  filter(`disease:ch1` %in% c("dilated cardiomyopathy", "non-failing")) %>%
+  mutate(condition = ifelse(`disease:ch1` == "non-failing", "NF", "DCM"))
+
+cat("\nGSE116250 after filter:", nrow(pheno_gse116250), "samples\n")
+print(table(pheno_gse116250$condition))
+
+# --- GSE141910 ---
+# Condition is stored in the 'etiology:ch1' column
+# Values: "Dilated cardiomyopathy (DCM)", "Non-Failing Donor",
+#         "Hypertrophic cardiomyopathy (HCM)", "Peripartum cardiomyopathy (PPCM)"
+cat("\nGSE141910 etiology groups:\n")
+print(table(pheno_gse141910[["etiology:ch1"]]))
+
+pheno_gse141910 <- pheno_gse141910 %>%
+  filter(`etiology:ch1` %in% c("Dilated cardiomyopathy (DCM)", "Non-Failing Donor")) %>%
+  mutate(condition = ifelse(`etiology:ch1` == "Non-Failing Donor", "NF", "DCM"))
+
+cat("\nGSE141910 after filter:", nrow(pheno_gse141910), "samples\n")
+print(table(pheno_gse141910$condition))
 ```
 
-```{r filter samples}
-# Find the characteristics column that contains disease labels (not tissue/age/sex)
-find_disease_col <- function(phenoData) {
-  char_cols <- grep("characteristics", colnames(phenoData), value = TRUE)
-  char_cols[sapply(char_cols, function(col) any(grepl("^disease:", phenoData[[col]])))][[1]]
-}
+---
 
-# Filter GSE116250: keep only non-failing and dilated cardiomyopathy samples
-gse116250_disease_col <- find_disease_col(gse116250_phenoData)
-gse116250_keep <- grepl("non.fail|dilated", gse116250_phenoData[[gse116250_disease_col]], ignore.case = TRUE)
-gse116250_phenoData <- gse116250_phenoData[gse116250_keep, ]
-cat("GSE116250 samples retained:", nrow(gse116250_phenoData), "\n")
-table(gse116250_phenoData[[gse116250_disease_col]])
+## Step 4: Load Count Matrices
 
-# Filter GSE141910: keep only non-failing and dilated cardiomyopathy samples
-gse141910_disease_col <- find_disease_col(gse141910_phenoData)
-gse141910_keep <- grepl("non.fail|dilated", gse141910_phenoData[[gse141910_disease_col]], ignore.case = TRUE)
-gse141910_phenoData <- gse141910_phenoData[gse141910_keep, ]
-cat("GSE141910 samples retained:", nrow(gse141910_phenoData), "\n")
-table(gse141910_phenoData[[gse141910_disease_col]])
-```
+### 4a. GSE116250 — Pre-assembled raw integer counts
 
-```{r load expression data}
-# --- GSE116250: download RPKM supplementary file ---
-if (!file.exists("GSE116250_rpkm.txt.gz")) {
-  getGEOSuppFiles("GSE116250", makeDirectory = FALSE, baseDir = ".")
-}
-rpkm_116250 <- read.table("GSE116250_rpkm.txt.gz", header = TRUE, row.names = 1, sep = "\t")
-
-# --- GSE141910: download per-sample count CSVs ---
-if (!file.exists("GSE141910_RAW.tar")) {
-  getGEOSuppFiles("GSE141910", makeDirectory = FALSE, baseDir = ".")
-}
-if (!dir.exists("GSE141910_counts")) {
-  dir.create("GSE141910_counts")
-  untar("GSE141910_RAW.tar", exdir = "GSE141910_counts")
-}
-csv_files <- list.files("GSE141910_counts", pattern = "\\.csv\\.gz$", full.names = TRUE)
-counts_list <- lapply(csv_files, function(f) {
-  df <- read.csv(f, header = FALSE, row.names = 1, col.names = c("gene", "count"))
-  setNames(df$count, rownames(df))
-})
-gsm_ids <- sub(".*?(GSM\\d+).*", "\\1", basename(csv_files))
-count_matrix_141910 <- do.call(cbind, counts_list)
-colnames(count_matrix_141910) <- gsm_ids
-```
-
-```{r normalize expression data}
-# --- GSE116250: log2(RPKM + 1), filter to retained samples ---
-kept_samples_116250 <- rownames(gse116250_phenoData)
-rpkm_116250 <- rpkm_116250[, colnames(rpkm_116250) %in% kept_samples_116250, drop = FALSE]
-
-# Filter lowly expressed genes: keep genes with RPKM >= 1 in at least 50% of samples
-keep_116250 <- rowSums(rpkm_116250 >= 1) >= (ncol(rpkm_116250) * 0.5)
-rpkm_116250 <- rpkm_116250[keep_116250, ]
-expr_116250 <- log2(rpkm_116250 + 1)
-cat("GSE116250: retained", nrow(expr_116250), "genes across", ncol(expr_116250), "samples\n")
-
-# --- GSE141910: DESeq2 VST on raw counts, filter to retained samples ---
-kept_samples_141910 <- rownames(gse141910_phenoData)
-count_matrix_141910 <- count_matrix_141910[, colnames(count_matrix_141910) %in% kept_samples_141910, drop = FALSE]
-count_matrix_141910 <- count_matrix_141910[rowSums(count_matrix_141910) > 0, ]
-
-col_data_141910 <- data.frame(
-  row.names = colnames(count_matrix_141910),
-  disease = gse141910_phenoData[colnames(count_matrix_141910), gse141910_disease_col]
+```{r load_gse116250_counts}
+# This file is a tab-separated matrix:
+#   rows    = genes (Entrez IDs)
+#   columns = samples (GSM accession IDs)
+#   values  = raw read counts from STAR/featureCounts
+counts_gse116250 <- read.table(
+  "GSE116250_raw_counts_GRCh38.p13_NCBI.tsv",
+  header      = TRUE,
+  sep         = "\t",
+  row.names   = 1,
+  check.names = FALSE
 )
-dds_141910 <- DESeqDataSetFromMatrix(
-  countData = count_matrix_141910,
-  colData   = col_data_141910,
-  design    = ~1
-)
-keep_141910 <- rowSums(counts(dds_141910) >= 10) >= (ncol(dds_141910) * 0.5)
-dds_141910 <- dds_141910[keep_141910, ]
-vst_141910 <- vst(dds_141910, blind = TRUE)
-expr_141910 <- assay(vst_141910)
-cat("GSE141910: retained", nrow(expr_141910), "genes across", ncol(expr_141910), "samples\n")
+
+cat("GSE116250 count matrix dimensions:", dim(counts_gse116250), "\n")
+cat("Gene ID format (Entrez):", head(rownames(counts_gse116250), 3), "\n")
+cat("Sample ID format (GSM):", head(colnames(counts_gse116250), 3), "\n")
+cat("Values are integers:", !any(as.matrix(counts_gse116250) != round(as.matrix(counts_gse116250)), na.rm = TRUE), "\n")
 ```
 
-```{r outlier detection}
-# Transpose to samples x genes for WGCNA; detect outliers via hierarchical clustering
-wgcna_116250 <- t(expr_116250)
-wgcna_141910 <- t(expr_141910)
+### 4b. GSE141910 — Assemble from individual per-sample files
 
+**Note:** The GEO-deposited files for GSE141910 contain Voom-transformed log2 values
+(confirmed by GEO metadata: *"Raw gene counts were transformed using SVA and the
+LIMMA-Voom method"*). Raw STAR counts were not deposited. These pre-normalised values
+will be used directly for WGCNA after filtering; DESeq2 will not be applied to this
+dataset.
+
+```{r assemble_gse141910_counts, message=FALSE}
+folder_path <- "GSE141910_counts"
+file_list   <- list.files(path = folder_path, pattern = "\\.gz$", full.names = TRUE)
+cat("Number of sample files found:", length(file_list), "\n")
+
+# Function to read one sample file and name its count column with the GSM accession ID
+read_and_name <- function(file) {
+  temp_data   <- read.csv(gzfile(file), header = TRUE)
+  # Extract the GSM accession ID from the filename (everything before the first underscore)
+  sample_name <- gsub("(_.*|\\.csv\\.gz|\\.gz)", "", basename(file))
+  colnames(temp_data) <- c("Gene", sample_name)
+  return(temp_data)
+}
+
+# Read all files and merge into a single matrix by the Gene column
+all_samples_list <- lapply(file_list, read_and_name)
+counts_gse141910 <- Reduce(
+  function(x, y) merge(x, y, by = "Gene", all = TRUE),
+  all_samples_list
+)
+
+# Promote gene IDs to row names
+rownames(counts_gse141910) <- counts_gse141910$Gene
+counts_gse141910 <- counts_gse141910[, -1]
+
+cat("GSE141910 count matrix dimensions:", dim(counts_gse141910), "\n")
+cat("Gene ID format (ENSEMBL):", head(rownames(counts_gse141910), 3), "\n")
+cat("Sample ID format (GSM):", head(colnames(counts_gse141910), 3), "\n")
+```
+
+---
+
+## Step 5: Align Count Matrices with Filtered Metadata
+
+```{r align_gse116250}
+# --- GSE116250 ---
+# Metadata rownames and count matrix column names are both GSM accession IDs
+cat("GSE116250 — samples in metadata:", nrow(pheno_gse116250), "\n")
+cat("GSE116250 — samples in count matrix:", ncol(counts_gse116250), "\n")
+cat("GSE116250 — matching samples:",
+    sum(colnames(counts_gse116250) %in% rownames(pheno_gse116250)), "\n")
+
+# Subset count matrix to filtered samples only, in metadata row order
+counts_gse116250 <- counts_gse116250[, rownames(pheno_gse116250)]
+
+# Sanity check: column order must exactly match metadata row order
+stopifnot(all(colnames(counts_gse116250) == rownames(pheno_gse116250)))
+cat("GSE116250 alignment check passed.\n")
+```
+
+```{r align_gse141910}
+# --- GSE141910 ---
+cat("GSE141910 — samples in metadata:", nrow(pheno_gse141910), "\n")
+cat("GSE141910 — samples in count matrix:", ncol(counts_gse141910), "\n")
+cat("GSE141910 — matching samples:",
+    sum(colnames(counts_gse141910) %in% rownames(pheno_gse141910)), "\n")
+
+counts_gse141910 <- counts_gse141910[, rownames(pheno_gse141910)]
+
+stopifnot(all(colnames(counts_gse141910) == rownames(pheno_gse141910)))
+cat("GSE141910 alignment check passed.\n")
+```
+
+---
+
+## Step 6: Normalise with DESeq2 (GSE116250 only)
+
+GSE116250 contains genuine raw integer counts and is processed through the full DESeq2
+pipeline. Variance stabilising transformation (VST) produces approximately log2-scale
+values suitable for WGCNA.
+
+```{r deseq2_gse116250, message=FALSE, warning=FALSE}
+# Build the DESeqDataSet with condition as the design variable
+dds116250 <- DESeqDataSetFromMatrix(
+  countData = counts_gse116250,
+  colData   = pheno_gse116250[, "condition", drop = FALSE],
+  design    = ~ condition
+)
+
+# Set NF as the reference level
+dds116250$condition <- relevel(factor(dds116250$condition), ref = "NF")
+
+# Pre-filter: remove genes with fewer than 10 counts in at least 50% of samples
+# This reduces memory and improves statistical power
+keep <- rowSums(counts(dds116250) >= 10) >= ceiling(ncol(dds116250) * 0.5)
+dds116250 <- dds116250[keep, ]
+cat("GSE116250 genes after low-count filter:", nrow(dds116250), "\n")
+
+# Run DESeq2 (estimates size factors, dispersions, and fits the model)
+dds116250 <- DESeq(dds116250)
+
+# Apply VST (blind = TRUE: do not use the design for transformation,
+# appropriate when combining datasets)
+vst116250    <- vst(dds116250, blind = TRUE)
+expr_gse116250 <- assay(vst116250)
+
+cat("GSE116250 VST expression matrix dimensions:", dim(expr_gse116250), "\n")
+cat("Value range:", round(min(expr_gse116250), 2), "—", round(max(expr_gse116250), 2), "\n")
+```
+
+---
+
+## Step 7: Filter GSE141910 Pre-normalised Values
+
+GSE141910 Voom values are on a log2 scale. We apply an expression filter analogous to
+the count filter above (retain genes expressed above log2(10+1) ≈ 3.46 in ≥50% of
+samples).
+
+```{r filter_gse141910}
+keep141910   <- rowSums(counts_gse141910 >= log2(10 + 1)) >= ceiling(ncol(counts_gse141910) * 0.5)
+expr_gse141910 <- as.matrix(counts_gse141910[keep141910, ])
+
+cat("GSE141910 genes after expression filter:", nrow(expr_gse141910), "\n")
+cat("Value range:", round(min(expr_gse141910), 2), "—", round(max(expr_gse141910), 2), "\n")
+```
+
+---
+
+## Step 8: Harmonise Gene IDs to HGNC Gene Symbols
+
+GSE116250 uses Entrez IDs; GSE141910 uses Ensembl IDs. Both are mapped to HGNC symbols
+so the two matrices share a common identifier for merging.
+
+```{r harmonise_ids_gse116250}
+# GSE116250: Entrez → HGNC symbol
+symbols_116250 <- mapIds(
+  org.Hs.eg.db,
+  keys      = rownames(expr_gse116250),
+  column    = "SYMBOL",
+  keytype   = "ENTREZID",
+  multiVals = "first"
+)
+
+# Retain only genes with a unique, non-NA symbol
+valid_116250   <- !is.na(symbols_116250) & !duplicated(symbols_116250)
+expr_gse116250 <- expr_gse116250[valid_116250, ]
+rownames(expr_gse116250) <- symbols_116250[valid_116250]
+
+cat("GSE116250 genes after ID mapping:", nrow(expr_gse116250), "\n")
+```
+
+```{r harmonise_ids_gse141910}
+# GSE141910: Ensembl → HGNC symbol
+symbols_141910 <- mapIds(
+  org.Hs.eg.db,
+  keys      = rownames(expr_gse141910),
+  column    = "SYMBOL",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+
+valid_141910   <- !is.na(symbols_141910) & !duplicated(symbols_141910)
+expr_gse141910 <- expr_gse141910[valid_141910, ]
+rownames(expr_gse141910) <- symbols_141910[valid_141910]
+
+cat("GSE141910 genes after ID mapping:", nrow(expr_gse141910), "\n")
+```
+
+---
+
+## Step 9: Combine Matrices and Correct for Batch Effects
+
+```{r combine_and_batch_correct, message=FALSE}
+# Find genes present in both datasets
+common_genes <- intersect(rownames(expr_gse116250), rownames(expr_gse141910))
+cat("Genes common to both datasets:", length(common_genes), "\n")
+
+# Subset both matrices to common genes (same row order)
+expr_116250_common <- expr_gse116250[common_genes, ]
+expr_141910_common <- expr_gse141910[common_genes, ]
+
+# Merge into a single expression matrix (genes × all samples)
+combined_expr <- cbind(expr_116250_common, expr_141910_common)
+cat("Combined matrix dimensions:", dim(combined_expr), "\n")
+
+# Build batch vector: 1 = GSE116250, 2 = GSE141910
+batch <- c(
+  rep(1, ncol(expr_116250_common)),
+  rep(2, ncol(expr_141910_common))
+)
+
+# Build combined condition vector for the ComBat model matrix
+combined_condition <- factor(c(pheno_gse116250$condition, pheno_gse141910$condition))
+mod <- model.matrix(~ combined_condition)
+
+# Apply ComBat to remove batch-driven variance while preserving biological signal
+combined_expr_corrected <- ComBat(
+  dat   = combined_expr,
+  batch = batch,
+  mod   = mod
+)
+
+cat("Batch-corrected matrix dimensions:", dim(combined_expr_corrected), "\n")
+
+# Build combined metadata for downstream WGCNA trait correlation
+combined_meta <- bind_rows(
+  pheno_gse116250 %>% select(geo_accession, condition) %>% mutate(dataset = "GSE116250"),
+  pheno_gse141910 %>% select(geo_accession, condition) %>% mutate(dataset = "GSE141910")
+)
+rownames(combined_meta) <- combined_meta$geo_accession
+```
+
+---
+
+## Step 10: Prepare for WGCNA
+
+WGCNA expects the expression matrix in **samples × genes** orientation.
+
+### 10a. Quality check — remove bad genes and samples
+
+```{r wgcna_qc}
+# Transpose: rows = samples, columns = genes
+wgcna_input <- t(combined_expr_corrected)
+
+# Identify and remove genes or samples with too many missing values or zero variance
+gsg <- goodSamplesGenes(wgcna_input, verbose = 3)
+
+if (!gsg$allOK) {
+  cat("Removing", sum(!gsg$goodGenes), "bad genes and",
+      sum(!gsg$goodSamples), "bad samples.\n")
+  wgcna_input <- wgcna_input[gsg$goodSamples, gsg$goodGenes]
+}
+
+cat("Final WGCNA input dimensions (samples × genes):", dim(wgcna_input), "\n")
+```
+
+### 10b. Sample outlier detection via hierarchical clustering
+
+```{r sample_outlier_plot, fig.width=14, fig.height=6}
+sampleTree <- hclust(dist(wgcna_input), method = "average")
+
+par(cex = 0.6, mar = c(0, 4, 2, 0))
+plot(
+  sampleTree,
+  main  = "Sample clustering to detect outliers",
+  sub   = "",
+  xlab  = "",
+  ylab  = "Height"
+)
+
+# Optional: draw a cut line to flag outliers (adjust height as needed after inspection)
+# abline(h = 80, col = "red")
+```
+
+### 10c. Soft-thresholding power selection
+
+```{r soft_threshold, fig.width=10, fig.height=5}
+powers <- c(1:10, seq(12, 20, by = 2))
+
+sft <- pickSoftThreshold(
+  wgcna_input,
+  powerVector = powers,
+  networkType = "signed",
+  verbose     = 5
+)
+
+# Plot 1: scale-free topology model fit (R²)
+# Plot 2: mean network connectivity
 par(mfrow = c(1, 2))
-plot(hclust(dist(wgcna_116250), method = "average"), main = "GSE116250 sample clustering",
-     xlab = "", sub = "", cex = 0.6)
-plot(hclust(dist(wgcna_141910), method = "average"), main = "GSE141910 sample clustering",
-     xlab = "", sub = "", cex = 0.6)
-par(mfrow = c(1, 1))
-# Inspect dendrograms and remove obvious outlier samples before network construction
-```
 
-```{r goodSamplesGenes check}
-# Check for genes/samples with excessive missing values or zero variance
-gsg_116250 <- goodSamplesGenes(wgcna_116250, verbose = 3)
-if (!gsg_116250$allOK) {
-  wgcna_116250 <- wgcna_116250[gsg_116250$goodSamples, gsg_116250$goodGenes]
-  cat("GSE116250: removed", sum(!gsg_116250$goodSamples), "samples and",
-      sum(!gsg_116250$goodGenes), "genes\n")
-}
-cat("GSE116250 final dimensions:", nrow(wgcna_116250), "samples x", ncol(wgcna_116250), "genes\n")
-
-gsg_141910 <- goodSamplesGenes(wgcna_141910, verbose = 3)
-if (!gsg_141910$allOK) {
-  wgcna_141910 <- wgcna_141910[gsg_141910$goodSamples, gsg_141910$goodGenes]
-  cat("GSE141910: removed", sum(!gsg_141910$goodSamples), "samples and",
-      sum(!gsg_141910$goodGenes), "genes\n")
-}
-cat("GSE141910 final dimensions:", nrow(wgcna_141910), "samples x", ncol(wgcna_141910), "genes\n")
-```
-
-```{r soft threshold selection, fig.width=12, fig.height=5}
-# Test powers 1-20 and pick the lowest power giving scale-free R^2 >= 0.85
-powers <- 1:20
-
-sft_116250 <- pickSoftThreshold(wgcna_116250, powerVector = powers,
-                                networkType = "signed", verbose = 2)
-sft_141910 <- pickSoftThreshold(wgcna_141910, powerVector = powers,
-                                networkType = "signed", verbose = 2)
-
-par(mfrow = c(2, 2))
-
-# GSE116250
-plot(sft_116250$fitIndices[, 1], -sign(sft_116250$fitIndices[, 3]) * sft_116250$fitIndices[, 2],
-     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology R^2",
-     main = "GSE116250: Scale-free fit", type = "n")
-text(sft_116250$fitIndices[, 1], -sign(sft_116250$fitIndices[, 3]) * sft_116250$fitIndices[, 2],
-     labels = powers, col = "red")
+plot(
+  sft$fitIndices[, 1],
+  -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+  xlab = "Soft Threshold (power)",
+  ylab = "Scale Free Topology Model Fit (signed R²)",
+  type = "n",
+  main = "Scale independence"
+)
+text(
+  sft$fitIndices[, 1],
+  -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+  labels = powers,
+  cex    = 0.9,
+  col    = "red"
+)
 abline(h = 0.85, col = "red", lty = 2)
 
-plot(sft_116250$fitIndices[, 1], sft_116250$fitIndices[, 5],
-     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
-     main = "GSE116250: Mean connectivity", type = "n")
-text(sft_116250$fitIndices[, 1], sft_116250$fitIndices[, 5], labels = powers, col = "red")
+plot(
+  sft$fitIndices[, 1],
+  sft$fitIndices[, 5],
+  xlab = "Soft Threshold (power)",
+  ylab = "Mean Connectivity",
+  type = "n",
+  main = "Mean connectivity"
+)
+text(
+  sft$fitIndices[, 1],
+  sft$fitIndices[, 5],
+  labels = powers,
+  cex    = 0.9,
+  col    = "red"
+)
+```
 
-# GSE141910
-plot(sft_141910$fitIndices[, 1], -sign(sft_141910$fitIndices[, 3]) * sft_141910$fitIndices[, 2],
-     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology R^2",
-     main = "GSE141910: Scale-free fit", type = "n")
-text(sft_141910$fitIndices[, 1], -sign(sft_141910$fitIndices[, 3]) * sft_141910$fitIndices[, 2],
-     labels = powers, col = "red")
-abline(h = 0.85, col = "red", lty = 2)
+```{r soft_threshold_result}
+# Choose the lowest power where R² ≥ 0.85
+soft_power <- sft$fitIndices %>%
+  mutate(signed_r2 = -sign(slope) * SFT.R.sq) %>%
+  filter(signed_r2 >= 0.85) %>%
+  slice(1) %>%
+  pull(Power)
 
-plot(sft_141910$fitIndices[, 1], sft_141910$fitIndices[, 5],
-     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
-     main = "GSE141910: Mean connectivity", type = "n")
-text(sft_141910$fitIndices[, 1], sft_141910$fitIndices[, 5], labels = powers, col = "red")
-
-par(mfrow = c(1, 1))
-
-# Print recommended powers
-cat("GSE116250 recommended power:", sft_116250$powerEstimate, "\n")
-cat("GSE141910 recommended power:", sft_141910$powerEstimate, "\n")
+cat("Selected soft-thresholding power:", soft_power, "\n")
 ```
