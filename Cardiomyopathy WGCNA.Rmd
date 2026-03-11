@@ -45,6 +45,7 @@ library(tidyverse)
 library(AnnotationDbi)
 library(org.Hs.eg.db)
 library(sva)
+library(gridExtra)
 
 # Allow multi-threading for WGCNA
 allowWGCNAThreads()
@@ -93,6 +94,16 @@ print(unique_141910)
 
 has_whitespace_141910 <- any(pheno_gse141910[["etiology:ch1"]] != trimws(pheno_gse141910[["etiology:ch1"]]))
 cat("Whitespace detected in GSE141910 etiology column:", has_whitespace_141910, "\n")
+
+# Print all available column names to identify which fields store age and sex.
+# GEO deposits clinical variables as "characteristic:ch1" columns — the exact
+# spelling varies by submitter (e.g. "age:ch1", "Age:ch1", "sex:ch1", "gender:ch1").
+# Review the output here; the extraction code in Step 3 auto-detects by pattern.
+cat("\n=== GSE116250 — all phenotype column names ===\n")
+print(colnames(pheno_gse116250))
+
+cat("\n=== GSE141910 — all phenotype column names ===\n")
+print(colnames(pheno_gse141910))
 ```
 
 ---
@@ -113,6 +124,28 @@ pheno_gse116250 <- pheno_gse116250 %>%
 cat("\nGSE116250 after filter:", nrow(pheno_gse116250), "samples\n")
 print(table(pheno_gse116250$condition))
 
+# --- Extract age and sex from GSE116250 ---
+# Auto-detect the column names; GEO naming is submitter-defined
+age_col_116250 <- grep("^age",         colnames(pheno_gse116250), ignore.case = TRUE, value = TRUE)[1]
+sex_col_116250 <- grep("^(sex|gender)", colnames(pheno_gse116250), ignore.case = TRUE, value = TRUE)[1]
+cat("GSE116250 age column detected:", age_col_116250, "\n")
+cat("GSE116250 sex column detected:", sex_col_116250, "\n")
+
+# Age: coerce to numeric (suppresses warning if any values are non-numeric / "NA")
+pheno_gse116250$age <- suppressWarnings(as.numeric(trimws(pheno_gse116250[[age_col_116250]])))
+
+# Sex: standardise to Male = 1, Female = 0, anything else = NA
+sex_raw_116250 <- trimws(tolower(pheno_gse116250[[sex_col_116250]]))
+pheno_gse116250$sex <- dplyr::case_when(
+  sex_raw_116250 == "male"   ~ 1L,
+  sex_raw_116250 == "female" ~ 0L,
+  TRUE                       ~ NA_integer_
+)
+cat("GSE116250 age summary: mean =", round(mean(pheno_gse116250$age, na.rm = TRUE), 1),
+    " NAs =", sum(is.na(pheno_gse116250$age)), "\n")
+cat("GSE116250 sex (1=M, 0=F, NA=unknown):", "\n")
+print(table(pheno_gse116250$sex, useNA = "ifany"))
+
 # --- GSE141910 ---
 # Condition is stored in the 'etiology:ch1' column
 # Values: "Dilated cardiomyopathy (DCM)", "Non-Failing Donor",
@@ -126,6 +159,25 @@ pheno_gse141910 <- pheno_gse141910 %>%
 
 cat("\nGSE141910 after filter:", nrow(pheno_gse141910), "samples\n")
 print(table(pheno_gse141910$condition))
+
+# --- Extract age and sex from GSE141910 ---
+age_col_141910 <- grep("^age",         colnames(pheno_gse141910), ignore.case = TRUE, value = TRUE)[1]
+sex_col_141910 <- grep("^(sex|gender)", colnames(pheno_gse141910), ignore.case = TRUE, value = TRUE)[1]
+cat("GSE141910 age column detected:", age_col_141910, "\n")
+cat("GSE141910 sex column detected:", sex_col_141910, "\n")
+
+pheno_gse141910$age <- suppressWarnings(as.numeric(trimws(pheno_gse141910[[age_col_141910]])))
+
+sex_raw_141910 <- trimws(tolower(pheno_gse141910[[sex_col_141910]]))
+pheno_gse141910$sex <- dplyr::case_when(
+  sex_raw_141910 == "male"   ~ 1L,
+  sex_raw_141910 == "female" ~ 0L,
+  TRUE                       ~ NA_integer_
+)
+cat("GSE141910 age summary: mean =", round(mean(pheno_gse141910$age, na.rm = TRUE), 1),
+    " NAs =", sum(is.na(pheno_gse141910$age)), "\n")
+cat("GSE141910 sex (1=M, 0=F, NA=unknown):", "\n")
+print(table(pheno_gse141910$sex, useNA = "ifany"))
 ```
 
 ---
@@ -446,11 +498,17 @@ combined_expr <- cbind(expr_116250_common, expr_141910_common)
 cat("Combined matrix dimensions (genes × samples):", dim(combined_expr), "\n")
 
 # Build combined metadata
+# age and sex were extracted in Step 3; they are carried through here so that
+# Step 13 can use them as additional trait columns in the heatmap
 combined_meta <- bind_rows(
-  pheno_gse116250 %>% dplyr::select(geo_accession, condition) %>% mutate(dataset = "GSE116250"),
-  pheno_gse141910 %>% dplyr::select(geo_accession, condition) %>% mutate(dataset = "GSE141910")
+  pheno_gse116250 %>% dplyr::select(geo_accession, condition, age, sex) %>% mutate(dataset = "GSE116250"),
+  pheno_gse141910 %>% dplyr::select(geo_accession, condition, age, sex) %>% mutate(dataset = "GSE141910")
 )
 rownames(combined_meta) <- combined_meta$geo_accession
+
+cat("Clinical covariate availability:\n")
+cat("  Age — non-missing:", sum(!is.na(combined_meta$age)), "/ total:", nrow(combined_meta), "\n")
+cat("  Sex — non-missing:", sum(!is.na(combined_meta$sex)), "/ total:", nrow(combined_meta), "\n")
 
 # Confirm columns of expression matrix match rows of metadata
 stopifnot(all(colnames(combined_expr) == rownames(combined_meta)))
@@ -489,7 +547,7 @@ cat("WGCNA input dimensions (samples × genes):", dim(wgcna_input), "\n")
 ## Step 11: Soft-Thresholding Power Selection
 
 ```{r soft_threshold, fig.width=10, fig.height=5}
-powers <- c(1:10, seq(12, 20, by = 2))
+powers <- c(1:10, seq(12, 30, by = 2))
 
 sft <- pickSoftThreshold(
   wgcna_input,
@@ -566,46 +624,59 @@ cat("Mean connectivity at power", soft_power, ":", round(sft$fitIndices[idx, 5],
 
 ## Step 12: Network Construction and Module Detection
 
-`blockwiseModules()` builds the full co-expression network and clusters genes into
-modules in a single call. Genes not assigned to any module are placed in the grey module.
+`blockwiseModules()` performs the core WGCNA computation in a single call:
+
+1. Raises the correlation matrix to `soft_power` to approximate a scale-free topology
+2. Computes the **Topological Overlap Matrix (TOM)** — a measure of how similarly connected two genes are across the whole network (more robust than raw correlation)
+3. Clusters genes hierarchically on 1 − TOM distance
+4. Cuts the dendrogram into **modules** (branches) using dynamic tree cutting
+5. Merges modules whose eigengenes are highly similar (`mergeCutHeight = 0.25` means modules sharing >75% eigengene correlation are collapsed)
+
+Genes that do not cluster into any module are assigned to the **grey module (label 0)** and excluded from downstream analysis.
 
 ```{r build_network, message=FALSE, warning=FALSE}
-
+# WGCNA's cor() is used internally; explicitly prefer it over base R's cor()
+# to avoid namespace conflicts introduced by loading other packages
 conflicts_prefer(WGCNA::cor)
 
 bwnet <- blockwiseModules(
   wgcna_input,
-  power             = soft_power,
+  power             = soft_power,  # soft-thresholding power chosen in Step 11
 
-  # Network type — must match pickSoftThreshold
+  # signed network: distinguishes positive (co-expressed) from negative
+  # (anti-correlated) gene relationships — appropriate for biological data
+  # where direction of co-expression is meaningful
   networkType       = "signed",
   TOMType           = "signed",
 
-  # Module detection
-  minModuleSize     = 30,      # minimum genes per module
-  mergeCutHeight    = 0.25,    # merge modules with >75% eigengene similarity
+  # Module detection parameters
+  minModuleSize     = 30,    # modules must contain at least 30 genes
+  mergeCutHeight    = 0.25,  # merge modules whose eigengenes correlate > 0.75
 
-  # Memory: set to at least ncol(wgcna_input) to process all genes in one block
+  # Process all genes in a single block (avoids artefacts from block-splitting)
+  # Requires sufficient RAM; reduce if memory errors occur
   maxBlockSize      = ncol(wgcna_input),
 
-  # Reproducibility
-  numericLabels     = TRUE,    # modules numbered 0, 1, 2 ... (0 = grey/unassigned)
+  numericLabels     = TRUE,  # modules labelled 0, 1, 2... (0 = grey/unassigned)
   saveTOMs          = FALSE,
   verbose           = 3
 )
 
-# Module summary
+# Convert numeric module labels to colour names (WGCNA convention)
+# e.g. 0 = "grey", 1 = "turquoise", 2 = "blue", etc.
 module_labels  <- bwnet$colors
 module_colours <- labels2colors(module_labels)
 
 cat("Number of modules detected (excluding grey):",
     length(unique(module_labels[module_labels != 0])), "\n")
-cat("Module sizes:\n")
+cat("Module sizes (number of genes per module):\n")
 print(table(module_colours))
 ```
 
 ```{r plot_dendrogram, fig.width=14, fig.height=6}
-# Gene dendrogram with module colour bar
+# Gene dendrogram: branches represent groups of co-expressed genes.
+# The colour bar beneath shows final module assignments after merging.
+# Genes in grey are unassigned. Each distinct colour is one module.
 plotDendroAndColors(
   bwnet$dendrograms[[1]],
   module_colours[bwnet$blockGenes[[1]]],
@@ -622,63 +693,262 @@ plotDendroAndColors(
 
 ## Step 13: Module–Trait Correlation
 
-Each module is summarised by its **eigengene** (first principal component). Here we
-correlate module eigengenes with the DCM vs non-failing trait to identify which modules
-are associated with disease.
+Each module is summarised by its **module eigengene (ME)** — the first principal
+component of the expression matrix for all genes in that module. The ME captures the
+dominant expression pattern shared across the module's genes and acts as a
+representative expression profile for the whole module.
 
-```{r module_trait_correlation, fig.width=10, fig.height=12}
-# Extract module eigengenes (samples × modules matrix)
+We correlate each ME with four traits:
+
+- **DCM:** the primary biological question — which modules are upregulated or
+  downregulated in DCM relative to non-failing hearts?
+- **Age:** continuous clinical covariate; identifies modules tracking patient age
+  independently of disease status.
+- **Sex:** binary clinical covariate (Male = 1, Female = 0); identifies sex-biased
+  expression modules.
+- **Dataset:** a quality control check — after ComBat batch correction, no module
+  should remain strongly correlated with study origin (GSE116250 vs GSE141910).
+  A module still tracking dataset after correction likely reflects residual technical
+  variation rather than biology.
+
+Age and sex may have missing values for some samples; `use = "pairwise.complete.obs"`
+ensures those samples are excluded per trait rather than dropping them globally.
+
+Each cell in the heatmap shows the Pearson **r** (correlation strength, −1 to 1) and
+its raw **p-value**. Red = positive correlation; blue = negative correlation.
+
+```{r module_trait_correlation, fig.width=12, fig.height=12}
+# Extract module eigengenes computed during blockwiseModules()
+# MEs is a samples × modules matrix; each column is one module's eigengene
 MEs <- bwnet$MEs
 
-# Rename eigengenes from numeric labels to colour labels for readability
-ME_colours      <- paste0("ME", labels2colors(as.numeric(gsub("ME", "", colnames(MEs)))))
-colnames(MEs)   <- ME_colours
+# blockwiseModules returns numeric labels (ME0, ME1, ...); convert to colour names
+# so the heatmap rows are labelled e.g. MEturquoise, MEblue, etc.
+ME_colours    <- paste0("ME", labels2colors(as.numeric(gsub("ME", "", colnames(MEs)))))
+colnames(MEs) <- ME_colours
 
-# Remove the grey eigengene (unassigned genes — not biologically meaningful)
+# Remove MEgrey — the grey module contains unassigned genes and has no
+# coherent biological meaning; correlating it with a trait is uninformative
 MEs <- MEs[, colnames(MEs) != "MEgrey"]
 
-# Binary trait: DCM = 1, NF = 0
-trait <- ifelse(combined_meta$condition == "DCM", 1, 0)
+# Trait data frame: one row per sample, one column per trait
+# DCM     = 1 (disease), 0 (control) — primary biological variable
+# Age     = continuous (years); may be NA for some samples
+# Sex     = 1 (Male), 0 (Female), NA (unknown) — binary clinical covariate
+# Dataset = 1 (GSE116250), 0 (GSE141910) — batch sanity check only
+trait_df <- data.frame(
+  DCM     = ifelse(combined_meta$condition == "DCM", 1, 0),
+  Age     = combined_meta$age,
+  Sex     = combined_meta$sex,
+  Dataset = ifelse(combined_meta$dataset == "GSE116250", 1, 0)
+)
+rownames(trait_df) <- rownames(combined_meta)
 nSamples <- nrow(wgcna_input)
 
-# Pearson correlation of each eigengene with the trait
-module_trait_cor <- cor(MEs, trait, use = "p")
+# Pearson correlation between each eigengene and each trait.
+# pairwise.complete.obs: for Age and Sex, only samples with non-NA values are
+# used when computing those correlations — other samples are not dropped globally.
+# corPvalueStudent() converts r to a t-statistic p-value using n − 2 df;
+# for Age/Sex the effective n may be smaller due to missing values.
+module_trait_cor <- cor(MEs, trait_df, use = "pairwise.complete.obs")
 module_trait_p   <- corPvalueStudent(module_trait_cor, nSamples)
 
-# Text labels showing correlation and p-value for each cell
+# Build the cell text: r on top line, p-value in parentheses below
 text_matrix <- paste0(
   round(module_trait_cor, 2), "\n(",
   signif(module_trait_p, 1), ")"
 )
 dim(text_matrix) <- dim(module_trait_cor)
 
-# Heatmap: rows = modules, column = DCM trait
+# Heatmap: each row is a module, columns are DCM and Dataset
+# Red  = positive correlation with trait (higher expression in DCM / in GSE116250)
+# Blue = negative correlation (lower expression in DCM / in GSE141910)
+# White = no correlation
 labeledHeatmap(
-  Matrix      = module_trait_cor,
-  xLabels     = "DCM",
-  yLabels     = colnames(MEs),
-  ySymbols    = colnames(MEs),
-  colorLabels = FALSE,
-  colors      = blueWhiteRed(50),
-  textMatrix  = text_matrix,
+  Matrix        = module_trait_cor,
+  xLabels       = colnames(trait_df),
+  yLabels       = colnames(MEs),
+  ySymbols      = colnames(MEs),
+  colorLabels   = FALSE,
+  colors        = blueWhiteRed(50),
+  textMatrix    = text_matrix,
   setStdMargins = FALSE,
-  cex.text    = 0.6,
-  zlim        = c(-1, 1),
-  main        = "Module–trait correlations (Pearson r, p-value)"
+  cex.text      = 0.6,
+  zlim          = c(-1, 1),
+  main          = "Module–trait correlations (Pearson r, p-value)"
 )
 ```
 
 ```{r significant_modules}
-# List modules significantly correlated with DCM (FDR < 0.05)
+# Filter to modules significantly associated with DCM after BH multiple-testing
+# correction. Age, Sex, and Dataset columns are included for contextual interpretation:
+#   r_age / r_sex  — check whether a module is driven by a confounding clinical variable
+#   r_dataset      — batch sanity check; should be near 0 after ComBat
 sig_modules <- data.frame(
   module    = colnames(MEs),
-  r         = round(module_trait_cor[, 1], 3),
-  p_value   = signif(module_trait_p[, 1], 3),
-  p_adj     = signif(p.adjust(module_trait_p[, 1], method = "BH"), 3)
+  r_DCM     = round(module_trait_cor[, "DCM"],     3),
+  p_value   = signif(module_trait_p[,  "DCM"],     3),
+  p_adj     = signif(p.adjust(module_trait_p[, "DCM"], method = "BH"), 3),
+  r_age     = round(module_trait_cor[, "Age"],     3),
+  r_sex     = round(module_trait_cor[, "Sex"],     3),
+  r_dataset = round(module_trait_cor[, "Dataset"], 3)
 ) %>%
   arrange(p_adj) %>%
   filter(p_adj < 0.05)
 
 cat("Modules significantly correlated with DCM (FDR < 0.05):\n")
 print(sig_modules)
+
+# Sanity check: a DCM-significant module with |r_dataset| > 0.3 may be driven
+# by study origin rather than true disease biology — interpret with caution
+confounded <- sig_modules %>% filter(abs(r_dataset) > 0.3)
+if (nrow(confounded) > 0) {
+  cat("\nWARNING — these modules may retain batch signal (|r_dataset| > 0.3):\n")
+  print(confounded$module)
+} else {
+  cat("\nNo DCM-significant modules show strong dataset correlation. ComBat successful.\n")
+}
+```
+
+---
+
+## Step 14: Hub Gene Identification
+
+**Module membership (kME)** is the Pearson correlation between a gene's expression
+profile and the module eigengene. A gene with kME close to 1 is tightly co-expressed
+with the rest of the module; a gene with low kME sits on the module periphery.
+
+**Hub genes** are defined as genes with the highest kME — they are the most central
+nodes in the co-expression network and represent the strongest candidate regulators or
+biomarkers for the biological process captured by each module.
+
+```{r hub_genes}
+# signedKME() computes the correlation between every gene and every module eigengene.
+# The result is a genes × modules matrix; each column is named kME<colour>.
+# Positive kME = gene expression moves with the eigengene (co-expressed with module).
+# Negative kME = gene expression moves against the eigengene (anti-correlated).
+kME <- signedKME(wgcna_input, MEs, outputColumnName = "kME")
+
+sig_module_names <- sig_modules$module
+
+# For each DCM-significant module, rank all module genes by kME and keep top 20
+hub_genes <- lapply(sig_module_names, function(mod) {
+  colour  <- gsub("ME", "", mod)
+  kme_col <- paste0("kME", colour)  # e.g. kMEturquoise
+
+  data.frame(
+    gene   = rownames(kME),
+    module = mod,
+    kME    = kME[[kme_col]]
+  ) %>%
+    arrange(desc(kME)) %>%
+    slice(1:20)
+})
+
+hub_genes_df <- bind_rows(hub_genes)
+
+cat("Top 20 hub genes per significant module (ranked by kME):\n")
+print(hub_genes_df)
+```
+
+```{r plot_hub_kme, fig.width=10, fig.height=5}
+# Dot plot showing kME of the top 20 hub genes per module.
+# Genes are sorted by kME (highest at top). Each facet is one module.
+# These are the candidate driver genes for further investigation.
+ggplot(hub_genes_df, aes(x = reorder(gene, kME), y = kME, colour = module)) +
+  geom_point(size = 2) +
+  facet_wrap(~ module, scales = "free_x") +
+  coord_flip() +
+  labs(
+    x     = "Gene",
+    y     = "Module membership (kME)",
+    title = "Top 20 hub genes per DCM-associated module"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+---
+
+## Step 15: Gene Significance vs Module Membership
+
+This plot validates the biological relevance of each significant module by comparing
+two independent measures for every gene:
+
+- **Gene Significance (GS):** the absolute Pearson correlation between a gene's
+  expression and the DCM trait (1 = disease, 0 = control). A high GS means the gene
+  is individually dysregulated in DCM, regardless of which module it belongs to.
+
+- **Module Membership (MM / kME):** how tightly a gene co-expresses with its module
+  eigengene (from Step 14). A high MM means the gene is a central hub of the module.
+
+**Interpretation:** If a module genuinely captures DCM biology, its hub genes (high MM)
+should also be the most disease-associated genes (high GS). A strong positive
+correlation between GS and MM within a module (r close to 1) confirms this. A flat or
+weak relationship suggests the module has internal co-expression structure but is not
+directly relevant to the DCM phenotype.
+
+```{r gs_mm, fig.width=14, fig.height=5}
+# Compute Gene Significance: correlate every gene with the binary DCM trait.
+# Result is a genes × 1 matrix; convert to data frame for easier handling.
+GS_DCM <- cor(wgcna_input, trait_df$DCM, use = "p")
+GS_DCM <- as.data.frame(GS_DCM)
+colnames(GS_DCM) <- "GS"
+
+# One scatter plot per significant module
+gs_mm_plots <- lapply(sig_module_names, function(mod) {
+  colour  <- gsub("ME", "", mod)
+  kme_col <- paste0("kME", colour)
+
+  # Restrict to genes actually assigned to this module
+  in_module <- module_colours == colour
+
+  df <- data.frame(
+    MM = kME[[kme_col]][in_module],  # module membership for genes in this module
+    GS = abs(GS_DCM$GS[in_module])  # absolute GS (direction already captured by r_DCM)
+  )
+
+  # Within-module GS–MM correlation: high r validates biological relevance
+  r_val <- round(cor(df$MM, df$GS, use = "p"), 2)
+
+  ggplot(df, aes(x = MM, y = GS)) +
+    geom_point(alpha = 0.4, size = 0.8, colour = colour) +
+    geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = 0.7) +
+    labs(
+      x       = paste0("Module membership (kME, ", colour, ")"),
+      y       = "Gene significance (|GS| for DCM)",
+      title   = paste0(mod, "  r = ", r_val),
+      caption = paste0("n = ", sum(in_module), " genes in module")
+    ) +
+    theme_bw()
+})
+
+# Display all module plots side by side (max 3 per row)
+n_cols <- min(3, length(gs_mm_plots))
+do.call(gridExtra::grid.arrange, c(gs_mm_plots, ncol = n_cols))
+```
+
+```{r gs_mm_summary}
+# Summary table: GS–MM correlation coefficient and significance per module.
+# High r_GS_MM = hub genes are the most disease-relevant genes = biologically valid.
+# Low r_GS_MM  = module structure is real but not driven by DCM phenotype.
+gs_mm_stats <- lapply(sig_module_names, function(mod) {
+  colour    <- gsub("ME", "", mod)
+  kme_col   <- paste0("kME", colour)
+  in_module <- module_colours == colour
+
+  mm <- kME[[kme_col]][in_module]
+  gs <- abs(GS_DCM$GS[in_module])
+
+  data.frame(
+    module   = mod,
+    r_GS_MM  = round(cor(mm, gs, use = "p"), 3),
+    p_value  = signif(cor.test(mm, gs)$p.value, 3),
+    n_genes  = sum(in_module)
+  )
+})
+
+gs_mm_stats_df <- bind_rows(gs_mm_stats)
+cat("GS–MM correlation per significant module:\n")
+print(gs_mm_stats_df)
 ```
