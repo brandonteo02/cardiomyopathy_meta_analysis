@@ -7,6 +7,10 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("intersect", "base")
 ```
 
 ### Background
@@ -26,7 +30,7 @@ Research question: What co-expressed gene modules are robustly associated with d
 if (!requireNamespace("BiocManager", quietly = TRUE))
   install.packages("BiocManager")
 
-bioc_pkgs <- c("WGCNA", "DESeq2", "GEOquery", "AnnotationDbi", "org.Hs.eg.db", "sva")
+bioc_pkgs <- c("WGCNA", "limma", "GEOquery", "AnnotationDbi", "org.Hs.eg.db", "sva")
 for (pkg in bioc_pkgs) {
   if (!requireNamespace(pkg, quietly = TRUE))
     BiocManager::install(pkg)
@@ -35,14 +39,12 @@ for (pkg in bioc_pkgs) {
 
 ```{r load_libraries, message=FALSE, warning=FALSE}
 library(WGCNA)
-library(DESeq2)
+library(limma)
 library(GEOquery)
 library(tidyverse)
 library(AnnotationDbi)
 library(org.Hs.eg.db)
 library(sva)
-library(CorLevelPlot)
-library(gridExtra)
 
 # Allow multi-threading for WGCNA
 allowWGCNAThreads()
@@ -65,6 +67,32 @@ pheno_gse141910 <- pData(phenoData(gse141910_geo))
 
 cat("GSE116250 total samples:", nrow(pheno_gse116250), "\n")
 cat("GSE141910 total samples:", nrow(pheno_gse141910), "\n")
+```
+
+---
+
+## Step 2b: Quality Check — Metadata Condition Labels
+
+Before filtering, inspect the **exact** strings in the condition columns. This catches
+capitalisation differences, trailing whitespace, or unexpected categories that would
+silently drop samples if the filter string doesn't match.
+
+```{r qc_metadata_labels}
+# Print the exact unique values — what you see here is what you must type in the filter
+cat("=== GSE116250 — unique values in 'disease:ch1' ===\n")
+unique_116250 <- unique(trimws(pheno_gse116250[["disease:ch1"]]))
+print(unique_116250)
+
+# Detect any leading/trailing whitespace (invisible but breaks string matching)
+has_whitespace_116250 <- any(pheno_gse116250[["disease:ch1"]] != trimws(pheno_gse116250[["disease:ch1"]]))
+cat("Whitespace detected in GSE116250 disease column:", has_whitespace_116250, "\n\n")
+
+cat("=== GSE141910 — unique values in 'etiology:ch1' ===\n")
+unique_141910 <- unique(trimws(pheno_gse141910[["etiology:ch1"]]))
+print(unique_141910)
+
+has_whitespace_141910 <- any(pheno_gse141910[["etiology:ch1"]] != trimws(pheno_gse141910[["etiology:ch1"]]))
+cat("Whitespace detected in GSE141910 etiology column:", has_whitespace_141910, "\n")
 ```
 
 ---
@@ -130,8 +158,7 @@ cat("Values are integers:", !any(as.matrix(counts_gse116250) != round(as.matrix(
 **Note:** The GEO-deposited files for GSE141910 contain Voom-transformed log2 values
 (confirmed by GEO metadata: *"Raw gene counts were transformed using SVA and the
 LIMMA-Voom method"*). Raw STAR counts were not deposited. These pre-normalised values
-will be used directly for WGCNA after filtering; DESeq2 will not be applied to this
-dataset.
+will be used directly for WGCNA after filtering; 
 
 ```{r assemble_gse141910_counts, message=FALSE}
 folder_path <- "GSE141910_counts"
@@ -148,9 +175,11 @@ read_and_name <- function(file) {
 }
 
 # Read all files and merge into a single matrix by the Gene column
+# Note all_samples_list takes a while to run as there are many folders to merge
+# all = FALSE: inner join — keeps only genes present in every sample, avoiding NAs
 all_samples_list <- lapply(file_list, read_and_name)
 counts_gse141910 <- Reduce(
-  function(x, y) merge(x, y, by = "Gene", all = TRUE),
+  function(x, y) merge(x, y, by = "Gene", all = FALSE),
   all_samples_list
 )
 
@@ -165,84 +194,163 @@ cat("Sample ID format (GSM):", head(colnames(counts_gse141910), 3), "\n")
 
 ---
 
-## Step 5: Align Count Matrices with Filtered Metadata
+## Step 4c: Quality Check — Count Matrices
 
-```{r align_gse116250}
+```{r qc_count_matrices}
 # --- GSE116250 ---
-# Metadata rownames and count matrix column names are both GSM accession IDs
-cat("GSE116250 — samples in metadata:", nrow(pheno_gse116250), "\n")
-cat("GSE116250 — samples in count matrix:", ncol(counts_gse116250), "\n")
-cat("GSE116250 — matching samples:",
-    sum(colnames(counts_gse116250) %in% rownames(pheno_gse116250)), "\n")
+cat("=== GSE116250 count matrix ===\n")
+cat("Dimensions (genes x samples):", dim(counts_gse116250), "\n")
+cat("Values are integers:", !any(as.matrix(counts_gse116250) != round(as.matrix(counts_gse116250)), na.rm = TRUE), "\n")
+cat("Missing values (NA):", sum(is.na(counts_gse116250)), "\n")
+cat("Value range: min =", min(as.matrix(counts_gse116250), na.rm = TRUE),
+    "  max =", max(as.matrix(counts_gse116250), na.rm = TRUE), "\n")
 
-# Subset count matrix to filtered samples only, in metadata row order
-counts_gse116250 <- counts_gse116250[, rownames(pheno_gse116250)]
+# Check that every sample in the filtered metadata exists in the count matrix
+missing_116250 <- base::setdiff(rownames(pheno_gse116250), colnames(counts_gse116250))
+cat("Metadata samples missing from count matrix:", length(missing_116250), "\n")
+if (length(missing_116250) > 0) print(missing_116250)
 
-# Sanity check: column order must exactly match metadata row order
-stopifnot(all(colnames(counts_gse116250) == rownames(pheno_gse116250)))
-cat("GSE116250 alignment check passed.\n")
-```
+# Preview top-left corner
+cat("\nFirst 5 genes x 4 samples:\n")
+print(counts_gse116250[1:5, 1:4])
 
-```{r align_gse141910}
 # --- GSE141910 ---
-cat("GSE141910 — samples in metadata:", nrow(pheno_gse141910), "\n")
-cat("GSE141910 — samples in count matrix:", ncol(counts_gse141910), "\n")
-cat("GSE141910 — matching samples:",
-    sum(colnames(counts_gse141910) %in% rownames(pheno_gse141910)), "\n")
+cat("\n=== GSE141910 count matrix ===\n")
+cat("Dimensions (genes x samples):", dim(counts_gse141910), "\n")
+cat("Values are non-integer (Voom log2):", any(as.matrix(counts_gse141910) != round(as.matrix(counts_gse141910)), na.rm = TRUE), "\n")
+cat("Missing values (NA):", sum(is.na(counts_gse141910)), "\n")
+cat("Value range: min =", round(min(as.matrix(counts_gse141910), na.rm = TRUE), 2),
+    "  max =", round(max(as.matrix(counts_gse141910), na.rm = TRUE), 2), "\n")
 
-counts_gse141910 <- counts_gse141910[, rownames(pheno_gse141910)]
+missing_141910 <- base::setdiff(rownames(pheno_gse141910), colnames(counts_gse141910))
+cat("Metadata samples missing from count matrix:", length(missing_141910), "\n")
+if (length(missing_141910) > 0) print(missing_141910)
 
-stopifnot(all(colnames(counts_gse141910) == rownames(pheno_gse141910)))
-cat("GSE141910 alignment check passed.\n")
+cat("\nFirst 5 genes x 4 samples:\n")
+print(round(counts_gse141910[1:5, 1:4], 3))
 ```
 
 ---
 
-## Step 6: Normalise with DESeq2 (GSE116250 only)
+## Step 5: Quality Check — Sample Name Matching
 
-GSE116250 contains genuine raw integer counts and is processed through the full DESeq2
-pipeline. Variance stabilising transformation (VST) produces approximately log2-scale
-values suitable for WGCNA.
+Run this **before** alignment. If any mismatches are found here, fix them before
+proceeding — the alignment step will crash without useful output if names don't match.
 
-```{r deseq2_gse116250, message=FALSE, warning=FALSE}
-# Build the DESeqDataSet with condition as the design variable
-dds116250 <- DESeqDataSetFromMatrix(
-  countData = counts_gse116250,
-  colData   = pheno_gse116250[, "condition", drop = FALSE],
-  design    = ~ condition
-)
+```{r qc_sample_matching}
+# ── GSE116250 ──────────────────────────────────────────────────────────────────
 
-# Set NF as the reference level
-dds116250$condition <- relevel(factor(dds116250$condition), ref = "NF")
+cat("=== GSE116250 sample name matching ===\n\n")
 
-# Pre-filter: remove genes with fewer than 10 counts in at least 50% of samples
-# This reduces memory and improves statistical power
-keep <- rowSums(counts(dds116250) >= 10) >= ceiling(ncol(dds116250) * 0.5)
-dds116250 <- dds116250[keep, ]
-cat("GSE116250 genes after low-count filter:", nrow(dds116250), "\n")
+# Side-by-side: first 6 metadata IDs vs count matrix column names
+cat("First 6 metadata rownames vs count matrix column names:\n")
+print(data.frame(
+  metadata_ID = head(rownames(pheno_gse116250)),
+  countmat_ID = head(colnames(counts_gse116250))
+))
 
-# Run DESeq2 (estimates size factors, dispersions, and fits the model)
-dds116250 <- DESeq(dds116250)
+# Any samples in filtered metadata absent from count matrix?
+only_in_meta_116250 <- base::setdiff(rownames(pheno_gse116250), colnames(counts_gse116250))
+cat("\nIn metadata but NOT in count matrix:", length(only_in_meta_116250), "\n")
+if (length(only_in_meta_116250) > 0) print(only_in_meta_116250)
 
-# Apply VST (blind = TRUE: do not use the design for transformation,
-# appropriate when combining datasets)
-vst116250    <- vst(dds116250, blind = TRUE)
-expr_gse116250 <- assay(vst116250)
+# Any extra columns in count matrix with no metadata entry?
+only_in_counts_116250 <- base::setdiff(colnames(counts_gse116250), rownames(pheno_gse116250))
+cat("In count matrix but NOT in metadata:", length(only_in_counts_116250), "\n")
+if (length(only_in_counts_116250) > 0) print(only_in_counts_116250)
 
-cat("GSE116250 VST expression matrix dimensions:", dim(expr_gse116250), "\n")
+cat("\nExpected condition breakdown (from metadata):\n")
+print(table(pheno_gse116250$condition))
+
+# ── GSE141910 ──────────────────────────────────────────────────────────────────
+
+cat("\n=== GSE141910 sample name matching ===\n\n")
+
+cat("First 6 metadata rownames vs count matrix column names:\n")
+print(data.frame(
+  metadata_ID = head(rownames(pheno_gse141910)),
+  countmat_ID = head(colnames(counts_gse141910))
+))
+
+only_in_meta_141910 <- base::setdiff(rownames(pheno_gse141910), colnames(counts_gse141910))
+cat("\nIn metadata but NOT in count matrix:", length(only_in_meta_141910), "\n")
+if (length(only_in_meta_141910) > 0) print(only_in_meta_141910)
+
+only_in_counts_141910 <- base::setdiff(colnames(counts_gse141910), rownames(pheno_gse141910))
+cat("In count matrix but NOT in metadata:", length(only_in_counts_141910), "\n")
+if (length(only_in_counts_141910) > 0) print(only_in_counts_141910)
+
+cat("\nExpected condition breakdown (from metadata):\n")
+print(table(pheno_gse141910$condition))
+```
+
+---
+
+## Step 6: Align Count Matrices with Filtered Metadata
+
+```{r align_gse116250}
+# Subset count matrix columns to the filtered samples, reordered to match metadata rows
+counts_gse116250 <- counts_gse116250[, rownames(pheno_gse116250)]
+
+# Hard stop: every column must exactly match the corresponding metadata row
+stopifnot(all(colnames(counts_gse116250) == rownames(pheno_gse116250)))
+cat("GSE116250 alignment check passed:",
+    ncol(counts_gse116250), "samples,",
+    nrow(counts_gse116250), "genes.\n")
+```
+
+```{r align_gse141910}
+counts_gse141910 <- counts_gse141910[, rownames(pheno_gse141910)]
+
+stopifnot(all(colnames(counts_gse141910) == rownames(pheno_gse141910)))
+cat("GSE141910 alignment check passed:",
+    ncol(counts_gse141910), "samples,",
+    nrow(counts_gse141910), "genes.\n")
+```
+
+---
+
+## Step 7: Normalise GSE116250 to log2-CPM
+
+GSE116250 raw integer counts are filtered then converted to log2-CPM, placing them on
+the same scale as the GSE141910 Voom log2-CPM values for merging.
+
+```{r normalise_gse116250, message=FALSE, warning=FALSE}
+# Filter: remove genes with counts < 15 in more than 75% of samples (WGCNA RNA-seq FAQ)
+# Equivalently: keep genes where count >= 15 in at least 25% of samples
+keep <- rowSums(counts_gse116250 >= 15) >= ceiling(ncol(counts_gse116250) * 0.25)
+filtered116250 <- as.matrix(counts_gse116250[keep, ])
+cat("GSE116250 genes after low-count filter:", nrow(filtered116250), "\n")
+
+# log2-CPM normalisation
+# lib.size: total mapped reads per sample — used to make samples comparable
+# regardless of sequencing depth. +0.5 / +1 are pseudocounts to avoid log(0).
+lib.size <- colSums(filtered116250)
+y <- t(log2(t(filtered116250 + 0.5) / (lib.size + 1) * 1e6))
+
+# Boxplot: raw counts vs log2-CPM — distributions should be roughly even across samples
+par(mfrow = c(1, 2))
+boxplot(log2(filtered116250 + 1),
+        las = 2, main = "Raw counts (log2)", ylab = "log2(count+1)")
+boxplot(y,
+        las = 2, main = "log2-CPM normalised", ylab = "log2-CPM")
+
+expr_gse116250 <- y
+cat("GSE116250 expression matrix dimensions:", dim(expr_gse116250), "\n")
 cat("Value range:", round(min(expr_gse116250), 2), "—", round(max(expr_gse116250), 2), "\n")
 ```
 
 ---
 
-## Step 7: Filter GSE141910 Pre-normalised Values
+## Step 7b: Filter GSE141910 Pre-normalised Values
 
-GSE141910 Voom values are on a log2 scale. We apply an expression filter analogous to
-the count filter above (retain genes expressed above log2(10+1) ≈ 3.46 in ≥50% of
-samples).
+GSE141910 Voom values are on a log2-CPM scale. The WGCNA FAQ threshold of 15 raw counts
+does not apply here. The standard limma/edgeR convention for log2-CPM data is to retain
+genes with log2-CPM > 1 (i.e. CPM > 2) in at least 25% of samples — equivalent to
+removing genes absent in more than 75% of samples.
 
 ```{r filter_gse141910}
-keep141910   <- rowSums(counts_gse141910 >= log2(10 + 1)) >= ceiling(ncol(counts_gse141910) * 0.5)
+keep141910   <- rowSums(counts_gse141910 >= 1) >= ceiling(ncol(counts_gse141910) * 0.25)
 expr_gse141910 <- as.matrix(counts_gse141910[keep141910, ])
 
 cat("GSE141910 genes after expression filter:", nrow(expr_gse141910), "\n")
@@ -293,91 +401,92 @@ cat("GSE141910 genes after ID mapping:", nrow(expr_gse141910), "\n")
 
 ---
 
-## Step 9: Combine Matrices and Correct for Batch Effects
+## Step 8b: Sample Clustering Per Dataset (Visual Inspection Only)
 
-```{r combine_and_batch_correct, message=FALSE}
+These dendrograms let you visually assess each dataset before merging.
+**Nothing is removed here.** They are provided for reference only.
+
+```{r outlier_dendrogram_gse116250, fig.width=14, fig.height=5}
+sampleTree_116250 <- hclust(dist(t(expr_gse116250)), method = "average")
+
+par(cex = 0.6, mar = c(0, 4, 2, 0))
+plot(
+  sampleTree_116250,
+  main = "GSE116250 — sample clustering (visual inspection only)",
+  sub  = "", xlab = "", ylab = "Height"
+)
+```
+
+```{r outlier_dendrogram_gse141910, fig.width=14, fig.height=5}
+sampleTree_141910 <- hclust(dist(t(expr_gse141910)), method = "average")
+
+par(cex = 0.6, mar = c(0, 4, 2, 0))
+plot(
+  sampleTree_141910,
+  main = "GSE141910 — sample clustering (visual inspection only)",
+  sub  = "", xlab = "", ylab = "Height"
+)
+```
+
+---
+
+## Step 9: Combine Matrices
+
+```{r combine_matrices, message=FALSE}
 # Find genes present in both datasets
 common_genes <- intersect(rownames(expr_gse116250), rownames(expr_gse141910))
 cat("Genes common to both datasets:", length(common_genes), "\n")
 
-# Subset both matrices to common genes (same row order)
+# Subset both matrices to common genes in the same row order
 expr_116250_common <- expr_gse116250[common_genes, ]
 expr_141910_common <- expr_gse141910[common_genes, ]
 
 # Merge into a single expression matrix (genes × all samples)
 combined_expr <- cbind(expr_116250_common, expr_141910_common)
-cat("Combined matrix dimensions:", dim(combined_expr), "\n")
+cat("Combined matrix dimensions (genes × samples):", dim(combined_expr), "\n")
 
-# Build batch vector: 1 = GSE116250, 2 = GSE141910
-batch <- c(
-  rep(1, ncol(expr_116250_common)),
-  rep(2, ncol(expr_141910_common))
+# Build combined metadata
+combined_meta <- bind_rows(
+  pheno_gse116250 %>% dplyr::select(geo_accession, condition) %>% mutate(dataset = "GSE116250"),
+  pheno_gse141910 %>% dplyr::select(geo_accession, condition) %>% mutate(dataset = "GSE141910")
 )
+rownames(combined_meta) <- combined_meta$geo_accession
 
-# Build combined condition vector for the ComBat model matrix
-combined_condition <- factor(c(pheno_gse116250$condition, pheno_gse141910$condition))
-mod <- model.matrix(~ combined_condition)
+# Confirm columns of expression matrix match rows of metadata
+stopifnot(all(colnames(combined_expr) == rownames(combined_meta)))
+cat("Expression matrix and metadata alignment confirmed.\n")
+```
 
-# Apply ComBat to remove batch-driven variance while preserving biological signal
+---
+
+## Step 10: Batch Correction with ComBat
+
+```{r batch_correction, message=FALSE}
+# Batch vector: 1 = GSE116250, 2 = GSE141910
+batch <- ifelse(combined_meta$dataset == "GSE116250", 1, 2)
+cat("Samples per batch:", table(batch), "\n")
+
+# Model matrix preserving the biological condition
+mod <- model.matrix(~ factor(combined_meta$condition))
+
+# ComBat expects genes × samples (combined_expr is already in that orientation)
 combined_expr_corrected <- ComBat(
   dat   = combined_expr,
   batch = batch,
   mod   = mod
 )
 
-cat("Batch-corrected matrix dimensions:", dim(combined_expr_corrected), "\n")
+cat("Batch-corrected matrix dimensions (genes × samples):",
+    dim(combined_expr_corrected), "\n")
 
-# Build combined metadata for downstream WGCNA trait correlation
-combined_meta <- bind_rows(
-  pheno_gse116250 %>% select(geo_accession, condition) %>% mutate(dataset = "GSE116250"),
-  pheno_gse141910 %>% select(geo_accession, condition) %>% mutate(dataset = "GSE141910")
-)
-rownames(combined_meta) <- combined_meta$geo_accession
+# Transpose to samples × genes for WGCNA
+wgcna_input <- t(combined_expr_corrected)
+cat("WGCNA input dimensions (samples × genes):", dim(wgcna_input), "\n")
 ```
 
 ---
 
-## Step 10: Prepare for WGCNA
-
-WGCNA expects the expression matrix in **samples × genes** orientation.
-
-### 10a. Quality check — remove bad genes and samples
-
-```{r wgcna_qc}
-# Transpose: rows = samples, columns = genes
-wgcna_input <- t(combined_expr_corrected)
-
-# Identify and remove genes or samples with too many missing values or zero variance
-gsg <- goodSamplesGenes(wgcna_input, verbose = 3)
-
-if (!gsg$allOK) {
-  cat("Removing", sum(!gsg$goodGenes), "bad genes and",
-      sum(!gsg$goodSamples), "bad samples.\n")
-  wgcna_input <- wgcna_input[gsg$goodSamples, gsg$goodGenes]
-}
-
-cat("Final WGCNA input dimensions (samples × genes):", dim(wgcna_input), "\n")
-```
-
-### 10b. Sample outlier detection via hierarchical clustering
-
-```{r sample_outlier_plot, fig.width=14, fig.height=6}
-sampleTree <- hclust(dist(wgcna_input), method = "average")
-
-par(cex = 0.6, mar = c(0, 4, 2, 0))
-plot(
-  sampleTree,
-  main  = "Sample clustering to detect outliers",
-  sub   = "",
-  xlab  = "",
-  ylab  = "Height"
-)
-
-# Optional: draw a cut line to flag outliers (adjust height as needed after inspection)
-# abline(h = 80, col = "red")
-```
-
-### 10c. Soft-thresholding power selection
+## Step 11: Soft-Thresholding Power Selection
 
 ```{r soft_threshold, fig.width=10, fig.height=5}
 powers <- c(1:10, seq(12, 20, by = 2))
@@ -389,8 +498,6 @@ sft <- pickSoftThreshold(
   verbose     = 5
 )
 
-# Plot 1: scale-free topology model fit (R²)
-# Plot 2: mean network connectivity
 par(mfrow = c(1, 2))
 
 plot(
@@ -404,9 +511,7 @@ plot(
 text(
   sft$fitIndices[, 1],
   -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
-  labels = powers,
-  cex    = 0.9,
-  col    = "red"
+  labels = powers, cex = 0.9, col = "red"
 )
 abline(h = 0.85, col = "red", lty = 2)
 
@@ -421,19 +526,159 @@ plot(
 text(
   sft$fitIndices[, 1],
   sft$fitIndices[, 5],
-  labels = powers,
-  cex    = 0.9,
-  col    = "red"
+  labels = powers, cex = 0.9, col = "red"
 )
 ```
 
 ```{r soft_threshold_result}
-# Choose the lowest power where R² ≥ 0.85
-soft_power <- sft$fitIndices %>%
+# Show R² and mean connectivity for all tested powers to inform the choice
+sft$fitIndices %>%
   mutate(signed_r2 = -sign(slope) * SFT.R.sq) %>%
-  filter(signed_r2 >= 0.85) %>%
-  slice(1) %>%
-  pull(Power)
+  dplyr::select(Power, signed_r2, mean.k.) %>%
+  print()
 
+# Choose the lowest power where signed R² ≥ 0.85
+candidates <- sft$fitIndices %>%
+  mutate(signed_r2 = -sign(slope) * SFT.R.sq) %>%
+  filter(signed_r2 >= 0.85)
+
+if (nrow(candidates) > 0) {
+  cat("Lowest power reaching R² ≥ 0.85:", candidates %>% slice(1) %>% pull(Power), "\n")
+} else {
+  cat("No power reached R² ≥ 0.85 — selecting manually.\n")
+}
+
+# Power 12 is selected by convention for signed networks when no single power
+# clearly reaches R² ≥ 0.85, following the WGCNA FAQ recommendation for
+# RNA-seq data (Langfelder & Horvath suggest power 12 as a default for
+# signed networks when the scale-free criterion is not cleanly met)
+soft_power <- 12
 cat("Selected soft-thresholding power:", soft_power, "\n")
+
+# Confirm R² and mean connectivity at chosen power
+idx       <- which(sft$fitIndices$Power == soft_power)
+signed_r2 <- -sign(sft$fitIndices$slope[idx]) * sft$fitIndices$SFT.R.sq[idx]
+cat("Scale-free R² at power", soft_power, ":", round(signed_r2, 3), "\n")
+cat("Mean connectivity at power", soft_power, ":", round(sft$fitIndices[idx, 5], 1), "\n")
+```
+
+---
+
+## Step 12: Network Construction and Module Detection
+
+`blockwiseModules()` builds the full co-expression network and clusters genes into
+modules in a single call. Genes not assigned to any module are placed in the grey module.
+
+```{r build_network, message=FALSE, warning=FALSE}
+
+conflicts_prefer(WGCNA::cor)
+
+bwnet <- blockwiseModules(
+  wgcna_input,
+  power             = soft_power,
+
+  # Network type — must match pickSoftThreshold
+  networkType       = "signed",
+  TOMType           = "signed",
+
+  # Module detection
+  minModuleSize     = 30,      # minimum genes per module
+  mergeCutHeight    = 0.25,    # merge modules with >75% eigengene similarity
+
+  # Memory: set to at least ncol(wgcna_input) to process all genes in one block
+  maxBlockSize      = ncol(wgcna_input),
+
+  # Reproducibility
+  numericLabels     = TRUE,    # modules numbered 0, 1, 2 ... (0 = grey/unassigned)
+  saveTOMs          = FALSE,
+  verbose           = 3
+)
+
+# Module summary
+module_labels  <- bwnet$colors
+module_colours <- labels2colors(module_labels)
+
+cat("Number of modules detected (excluding grey):",
+    length(unique(module_labels[module_labels != 0])), "\n")
+cat("Module sizes:\n")
+print(table(module_colours))
+```
+
+```{r plot_dendrogram, fig.width=14, fig.height=6}
+# Gene dendrogram with module colour bar
+plotDendroAndColors(
+  bwnet$dendrograms[[1]],
+  module_colours[bwnet$blockGenes[[1]]],
+  "Module colours",
+  dendroLabels = FALSE,
+  hang         = 0.03,
+  addGuide     = TRUE,
+  guideHang    = 0.05,
+  main         = "Gene dendrogram and module assignment"
+)
+```
+
+---
+
+## Step 13: Module–Trait Correlation
+
+Each module is summarised by its **eigengene** (first principal component). Here we
+correlate module eigengenes with the DCM vs non-failing trait to identify which modules
+are associated with disease.
+
+```{r module_trait_correlation, fig.width=10, fig.height=12}
+# Extract module eigengenes (samples × modules matrix)
+MEs <- bwnet$MEs
+
+# Rename eigengenes from numeric labels to colour labels for readability
+ME_colours      <- paste0("ME", labels2colors(as.numeric(gsub("ME", "", colnames(MEs)))))
+colnames(MEs)   <- ME_colours
+
+# Remove the grey eigengene (unassigned genes — not biologically meaningful)
+MEs <- MEs[, colnames(MEs) != "MEgrey"]
+
+# Binary trait: DCM = 1, NF = 0
+trait <- ifelse(combined_meta$condition == "DCM", 1, 0)
+nSamples <- nrow(wgcna_input)
+
+# Pearson correlation of each eigengene with the trait
+module_trait_cor <- cor(MEs, trait, use = "p")
+module_trait_p   <- corPvalueStudent(module_trait_cor, nSamples)
+
+# Text labels showing correlation and p-value for each cell
+text_matrix <- paste0(
+  round(module_trait_cor, 2), "\n(",
+  signif(module_trait_p, 1), ")"
+)
+dim(text_matrix) <- dim(module_trait_cor)
+
+# Heatmap: rows = modules, column = DCM trait
+labeledHeatmap(
+  Matrix      = module_trait_cor,
+  xLabels     = "DCM",
+  yLabels     = colnames(MEs),
+  ySymbols    = colnames(MEs),
+  colorLabels = FALSE,
+  colors      = blueWhiteRed(50),
+  textMatrix  = text_matrix,
+  setStdMargins = FALSE,
+  cex.text    = 0.6,
+  zlim        = c(-1, 1),
+  main        = "Module–trait correlations (Pearson r, p-value)"
+)
+```
+
+```{r significant_modules}
+# List modules significantly correlated with DCM (FDR < 0.05)
+sig_modules <- data.frame(
+  module    = colnames(MEs),
+  r         = round(module_trait_cor[, 1], 3),
+  p_value   = signif(module_trait_p[, 1], 3),
+  p_adj     = signif(p.adjust(module_trait_p[, 1], method = "BH"), 3)
+) %>%
+  arrange(p_adj) %>%
+  filter(p_adj < 0.05)
+
+cat("Modules significantly correlated with DCM (FDR < 0.05):\n")
+print(sig_modules)
 ```
