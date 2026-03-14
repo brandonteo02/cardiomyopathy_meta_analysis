@@ -54,14 +54,11 @@ library(gridExtra)
 allowWGCNAThreads()
 ```
 
----
-
 ## Step 2: Load Metadata (Series Matrices)
 
 ```{r load_metadata, message=FALSE, warning=FALSE}
-setwd("./Cardiomyopathy WGCNA/")
 getwd()
-# Load GEO series matrix files — these contain sample-level metadata only
+# Load GEO series matrix files, these contain sample-level metadata only
 gse116250_geo <- getGEO(filename = "GSE116250_series_matrix.txt",    GSEMatrix = TRUE)
 gse141910_geo <- getGEO(filename = "GSE141910_series_matrix.txt.gz", GSEMatrix = TRUE)
 
@@ -73,8 +70,6 @@ cat("GSE116250 total samples:", nrow(pheno_gse116250), "\n")
 cat("GSE141910 total samples:", nrow(pheno_gse141910), "\n")
 ```
 
----
-
 ## Step 2b: Quality Check — Metadata Condition Labels
 
 Before filtering, inspect the **exact** strings in the condition columns. This catches
@@ -82,7 +77,7 @@ capitalisation differences, trailing whitespace, or unexpected categories that w
 silently drop samples if the filter string doesn't match.
 
 ```{r qc_metadata_labels}
-# Print the exact unique values — what you see here is what you must type in the filter
+# Print the exact unique values, what you see here is what you must type in the filter
 cat("=== GSE116250 — unique values in 'disease:ch1' ===\n")
 unique_116250 <- unique(trimws(pheno_gse116250[["disease:ch1"]]))
 print(unique_116250)
@@ -109,12 +104,10 @@ cat("\n=== GSE141910 — all phenotype column names ===\n")
 print(colnames(pheno_gse141910))
 ```
 
----
-
 ## Step 3: Filter Metadata to DCM and Non-Failing Samples Only
 
 ```{r filter_metadata}
-# --- GSE116250 ---
+# GSE116250
 # Condition is stored in the 'disease:ch1' column
 # Values: "dilated cardiomyopathy", "ischemic cardiomyopathy", "non-failing"
 cat("GSE116250 disease groups:\n")
@@ -127,7 +120,7 @@ pheno_gse116250 <- pheno_gse116250 %>%
 cat("\nGSE116250 after filter:", nrow(pheno_gse116250), "samples\n")
 print(table(pheno_gse116250$condition))
 
-# --- Extract age and sex from GSE116250 ---
+# Extract age and sex from GSE116250
 # Auto-detect the column names; GEO naming is submitter-defined
 age_col_116250 <- grep("^age",         colnames(pheno_gse116250), ignore.case = TRUE, value = TRUE)[1]
 sex_col_116250 <- grep("^(sex|gender)", colnames(pheno_gse116250), ignore.case = TRUE, value = TRUE)[1]
@@ -149,7 +142,7 @@ cat("GSE116250 age summary: mean =", round(mean(pheno_gse116250$age, na.rm = TRU
 cat("GSE116250 sex (1=M, 0=F, NA=unknown):", "\n")
 print(table(pheno_gse116250$sex, useNA = "ifany"))
 
-# --- GSE141910 ---
+# GSE141910
 # Condition is stored in the 'etiology:ch1' column
 # Values: "Dilated cardiomyopathy (DCM)", "Non-Failing Donor",
 #         "Hypertrophic cardiomyopathy (HCM)", "Peripartum cardiomyopathy (PPCM)"
@@ -163,7 +156,7 @@ pheno_gse141910 <- pheno_gse141910 %>%
 cat("\nGSE141910 after filter:", nrow(pheno_gse141910), "samples\n")
 print(table(pheno_gse141910$condition))
 
-# --- Extract age and sex from GSE141910 ---
+#Extract age and sex from GSE141910
 age_col_141910 <- grep("^age",         colnames(pheno_gse141910), ignore.case = TRUE, value = TRUE)[1]
 sex_col_141910 <- grep("^(sex|gender)", colnames(pheno_gse141910), ignore.case = TRUE, value = TRUE)[1]
 cat("GSE141910 age column detected:", age_col_141910, "\n")
@@ -182,8 +175,6 @@ cat("GSE141910 age summary: mean =", round(mean(pheno_gse141910$age, na.rm = TRU
 cat("GSE141910 sex (1=M, 0=F, NA=unknown):", "\n")
 print(table(pheno_gse141910$sex, useNA = "ifany"))
 ```
-
----
 
 ## Step 4: Load Count Matrices
 
@@ -230,7 +221,7 @@ read_and_name <- function(file) {
 }
 
 # Read all files and merge into a single matrix by the Gene column
-# Note all_samples_list takes a while to run as there are many folders to merge
+# Note all_samples_list takes a while to run as there are many folders to merge, may take 10minutes
 # all = FALSE: inner join — keeps only genes present in every sample, avoiding NAs
 all_samples_list <- lapply(file_list, read_and_name)
 counts_gse141910 <- Reduce(
@@ -247,12 +238,10 @@ cat("Gene ID format (ENSEMBL):", head(rownames(counts_gse141910), 3), "\n")
 cat("Sample ID format (GSM):", head(colnames(counts_gse141910), 3), "\n")
 ```
 
----
-
 ## Step 4c: Quality Check — Count Matrices
 
 ```{r qc_count_matrices}
-# --- GSE116250 ---
+# GSE116250
 cat("=== GSE116250 count matrix ===\n")
 cat("Dimensions (genes x samples):", dim(counts_gse116250), "\n")
 cat("Values are integers:", !any(as.matrix(counts_gse116250) != round(as.matrix(counts_gse116250)), na.rm = TRUE), "\n")
@@ -269,7 +258,7 @@ if (length(missing_116250) > 0) print(missing_116250)
 cat("\nFirst 5 genes x 4 samples:\n")
 print(counts_gse116250[1:5, 1:4])
 
-# --- GSE141910 ---
+# GSE141910
 cat("\n=== GSE141910 count matrix ===\n")
 cat("Dimensions (genes x samples):", dim(counts_gse141910), "\n")
 cat("Values are non-integer (Voom log2):", any(as.matrix(counts_gse141910) != round(as.matrix(counts_gse141910)), na.rm = TRUE), "\n")
@@ -285,15 +274,13 @@ cat("\nFirst 5 genes x 4 samples:\n")
 print(round(counts_gse141910[1:5, 1:4], 3))
 ```
 
----
-
 ## Step 5: Quality Check — Sample Name Matching
 
 Run this **before** alignment. If any mismatches are found here, fix them before
 proceeding — the alignment step will crash without useful output if names don't match.
 
 ```{r qc_sample_matching}
-# ── GSE116250 ──────────────────────────────────────────────────────────────────
+# GSE116250
 
 cat("=== GSE116250 sample name matching ===\n\n")
 
@@ -317,7 +304,7 @@ if (length(only_in_counts_116250) > 0) print(only_in_counts_116250)
 cat("\nExpected condition breakdown (from metadata):\n")
 print(table(pheno_gse116250$condition))
 
-# ── GSE141910 ──────────────────────────────────────────────────────────────────
+# GSE141910
 
 cat("\n=== GSE141910 sample name matching ===\n\n")
 
@@ -338,8 +325,6 @@ if (length(only_in_counts_141910) > 0) print(only_in_counts_141910)
 cat("\nExpected condition breakdown (from metadata):\n")
 print(table(pheno_gse141910$condition))
 ```
-
----
 
 ## Step 6: Align Count Matrices with Filtered Metadata
 
@@ -362,8 +347,6 @@ cat("GSE141910 alignment check passed:",
     ncol(counts_gse141910), "samples,",
     nrow(counts_gse141910), "genes.\n")
 ```
-
----
 
 ## Step 7: Normalise GSE116250 to log2-CPM
 
@@ -395,8 +378,6 @@ cat("GSE116250 expression matrix dimensions:", dim(expr_gse116250), "\n")
 cat("Value range:", round(min(expr_gse116250), 2), "—", round(max(expr_gse116250), 2), "\n")
 ```
 
----
-
 ## Step 7b: Filter GSE141910 Pre-normalised Values
 
 GSE141910 Voom values are on a log2-CPM scale. The WGCNA FAQ threshold of 15 raw counts
@@ -411,8 +392,6 @@ expr_gse141910 <- as.matrix(counts_gse141910[keep141910, ])
 cat("GSE141910 genes after expression filter:", nrow(expr_gse141910), "\n")
 cat("Value range:", round(min(expr_gse141910), 2), "—", round(max(expr_gse141910), 2), "\n")
 ```
-
----
 
 ## Step 8: Harmonise Gene IDs to HGNC Gene Symbols
 
@@ -454,8 +433,6 @@ rownames(expr_gse141910) <- symbols_141910[valid_141910]
 cat("GSE141910 genes after ID mapping:", nrow(expr_gse141910), "\n")
 ```
 
----
-
 ## Step 8b: Sample Clustering Per Dataset (Visual Inspection Only)
 
 These dendrograms let you visually assess each dataset before merging.
@@ -482,8 +459,6 @@ plot(
   sub  = "", xlab = "", ylab = "Height"
 )
 ```
-
----
 
 ## Step 9: Combine Matrices
 
@@ -518,8 +493,6 @@ stopifnot(all(colnames(combined_expr) == rownames(combined_meta)))
 cat("Expression matrix and metadata alignment confirmed.\n")
 ```
 
----
-
 ## Step 10: Batch Correction with ComBat
 
 ```{r batch_correction, message=FALSE}
@@ -536,7 +509,7 @@ combined_expr_corrected <- ComBat(
   batch = batch,
   mod   = mod
 )
-
+saveRDS(combined_expr_corrected, file = "batch_effect_corrected_matrix.rds")
 cat("Batch-corrected matrix dimensions (genes × samples):",
     dim(combined_expr_corrected), "\n")
 
@@ -544,8 +517,6 @@ cat("Batch-corrected matrix dimensions (genes × samples):",
 wgcna_input <- t(combined_expr_corrected)
 cat("WGCNA input dimensions (samples × genes):", dim(wgcna_input), "\n")
 ```
-
----
 
 ## Step 11: Soft-Thresholding Power Selection
 
@@ -623,8 +594,6 @@ cat("Scale-free R² at power", soft_power, ":", round(signed_r2, 3), "\n")
 cat("Mean connectivity at power", soft_power, ":", round(sft$fitIndices[idx, 5], 1), "\n")
 ```
 
----
-
 ## Step 12: Network Construction and Module Detection
 
 `blockwiseModules()` performs the core WGCNA computation in a single call:
@@ -647,7 +616,7 @@ bwnet <- blockwiseModules(
   power             = soft_power,  # soft-thresholding power chosen in Step 11
 
   # signed network: distinguishes positive (co-expressed) from negative
-  # (anti-correlated) gene relationships — appropriate for biological data
+  # (anti-correlated) gene relationships : appropriate for biological data
   # where direction of co-expression is meaningful
   networkType       = "signed",
   TOMType           = "signed",
@@ -692,8 +661,6 @@ plotDendroAndColors(
 )
 ```
 
----
-
 ## Step 13: Module–Trait Correlation
 
 Each module is summarised by its **module eigengene (ME)** — the first principal
@@ -730,7 +697,7 @@ MEs <- bwnet$MEs
 ME_colours    <- paste0("ME", labels2colors(as.numeric(gsub("ME", "", colnames(MEs)))))
 colnames(MEs) <- ME_colours
 
-# Remove MEgrey — the grey module contains unassigned genes and has no
+# Remove MEgrey, the grey module contains unassigned genes and has no
 # coherent biological meaning; correlating it with a trait is uninformative
 MEs <- MEs[, colnames(MEs) != "MEgrey"]
 
@@ -750,7 +717,7 @@ nSamples <- nrow(wgcna_input)
 
 # Pearson correlation between each eigengene and each trait.
 # pairwise.complete.obs: for Age and Sex, only samples with non-NA values are
-# used when computing those correlations — other samples are not dropped globally.
+# used when computing those correlations, other samples are not dropped globally.
 # corPvalueStudent() converts r to a t-statistic p-value using n − 2 df;
 # for Age/Sex the effective n may be smaller due to missing values.
 module_trait_cor <- cor(MEs, trait_df, use = "pairwise.complete.obs")
@@ -812,8 +779,6 @@ if (nrow(confounded) > 0) {
   cat("\nNo DCM-significant modules show strong dataset correlation. ComBat successful.\n")
 }
 ```
-
----
 
 ## Step 14: Hub Gene Identification
 
@@ -906,7 +871,7 @@ gs_mm_plots <- lapply(sig_module_names, function(mod) {
   colour  <- gsub("ME", "", mod)
   kme_col <- paste0("kME", colour)
 
-  # Restrict to genes actually assigned to this module
+# Restrict to genes actually assigned to this module
   in_module <- module_colours == colour
 
   df <- data.frame(
@@ -961,4 +926,4 @@ print(gs_mm_stats_df)
 
 #Summary: 
 
-With this analysis, I have identified hubs of genes that are correlated and uncorrelated to the onset of 
+Dilated cardiomyopathy is the most common form of non-ischemic cardiomyopathy and the leading indication for heart transplanation worldwide, it typically carries a poor prognosis, with a 50% 5-year mortality without transplant. Over 60 genes have been identified to be causative of Dilated Cardiomyopathy but a large proportion of cases remain unexplained that can be improved with processes like WGCNA. With this meta analysis, I have combined 2 studies together to identify co-expression modules containing hub genes positively and negatively correlated with the onset of dilated cardiomyopathy. Identifying relevant hub genes is essential towards finding novel therapies for Dilated Cardiomyopathy by precisely targeting and interfering with specific portions of the relevant pathways. As a preliminary example, inputting the top 20 hub genes within the MEyellow module into EnrichR, suggests that they are involved in Reactome pathways, suggesting coordinated involvement in extracellular matrix remodeling. Differential expression analysis within individual modules may further clarify gene-level relationships, and in time, these findings could inform the identification of novel therapeutic targets. Differential expression analyses can be utilized to compare the differences in expression of a particular gene of a patient to a healthy person. Such analysis can be done for all genes, and upon comparison against the gene modules we can better understand how the genes may relate to each other to fully elucidate the biological roles and pathway interactions of these candidates to determine significance to disease progression. 
