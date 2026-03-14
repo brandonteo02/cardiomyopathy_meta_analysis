@@ -3,6 +3,8 @@ title: "Cardiomyopathy WGCNA"
 author: "Brandon Teo"
 date: "2026-03-06"
 output: html_document
+editor_options: 
+  chunk_output_type: inline
 ---
 
 ```{r setup, include=FALSE}
@@ -11,6 +13,7 @@ library(conflicted)
 conflict_prefer("select", "dplyr")
 conflict_prefer("filter", "dplyr")
 conflict_prefer("intersect", "base")
+conflicts_prefer(dplyr::slice)
 ```
 
 ### Background
@@ -56,8 +59,8 @@ allowWGCNAThreads()
 ## Step 2: Load Metadata (Series Matrices)
 
 ```{r load_metadata, message=FALSE, warning=FALSE}
-setwd("~/Desktop/University/NUS research task/Cardiomyopathy WGCNA/")
-
+setwd("./Cardiomyopathy WGCNA/")
+getwd()
 # Load GEO series matrix files — these contain sample-level metadata only
 gse116250_geo <- getGEO(filename = "GSE116250_series_matrix.txt",    GSEMatrix = TRUE)
 gse141910_geo <- getGEO(filename = "GSE141910_series_matrix.txt.gz", GSEMatrix = TRUE)
@@ -851,14 +854,19 @@ cat("Top 20 hub genes per significant module (ranked by kME):\n")
 print(hub_genes_df)
 ```
 
-```{r plot_hub_kme, fig.width=10, fig.height=5}
+```{r plot_hub_kme, fig.width=15, fig.height=10}
+# Restrict plot to the three modules of interest
+top3_modules  <- c("MEyellow", "MEred", "MEpurple")
+plot_hub_df   <- hub_genes_df %>% dplyr::filter(module %in% top3_modules)
+
 # Dot plot showing kME of the top 20 hub genes per module.
 # Genes are sorted by kME (highest at top). Each facet is one module.
-# These are the candidate driver genes for further investigation.
-ggplot(hub_genes_df, aes(x = reorder(gene, kME), y = kME, colour = module)) +
+# Dot colours match the WGCNA module colour convention.
+ggplot(plot_hub_df, aes(x = reorder(gene, kME), y = kME, colour = module)) +
   geom_point(size = 2) +
-  facet_wrap(~ module, scales = "free_x") +
+  facet_wrap(~ module, scales = "free_y", ncol = 3) +
   coord_flip() +
+  scale_colour_manual(values = c(MEyellow = "yellow3", MEred = "red", MEpurple = "purple")) +
   labs(
     x     = "Gene",
     y     = "Module membership (kME)",
@@ -867,8 +875,6 @@ ggplot(hub_genes_df, aes(x = reorder(gene, kME), y = kME, colour = module)) +
   theme_bw() +
   theme(legend.position = "none")
 ```
-
----
 
 ## Step 15: Gene Significance vs Module Membership
 
@@ -952,3 +958,7 @@ gs_mm_stats_df <- bind_rows(gs_mm_stats)
 cat("GS–MM correlation per significant module:\n")
 print(gs_mm_stats_df)
 ```
+
+#Summary: 
+
+With this analysis, I have identified hubs of genes that are correlated and uncorrelated to the onset of 
